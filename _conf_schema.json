@@ -1,0 +1,41 @@
+{
+  "default_render_mode": {
+    "description": "默认输出模式",
+    "type": "string",
+    "default": "html",
+    "options": ["html", "text"],
+    "hint": "html 为单条图片消息，text 为单条纯文本消息。"
+  },
+  "html_background": {
+    "description": "HTML 生图背景",
+    "type": "text",
+    "default": "radial-gradient(circle at top left, rgba(99, 102, 241, 0.35), transparent 28%), radial-gradient(circle at top right, rgba(16, 185, 129, 0.28), transparent 24%), linear-gradient(135deg, #111827 0%, #0f172a 52%, #111827 100%)",
+    "hint": "填写 CSS background 值。支持渐变、纯色、url(...) 背景图。",
+    "editor_mode": true,
+    "editor_language": "css"
+  },
+  "server_display_limit": {
+    "description": "消息内展示的服务器数量",
+    "type": "int",
+    "default": 15,
+    "hint": "为了避免单条消息过长，初版默认只展示延迟最优的前 N 个服务器。"
+  },
+  "server_page_size": {
+    "description": "每次拉取公开服务器的分页大小",
+    "type": "int",
+    "default": 100,
+    "hint": "Roblox API 单次最多 100，通常保持默认即可。"
+  },
+  "server_scan_page_limit": {
+    "description": "公开服务器扫描页数上限",
+    "type": "int",
+    "default": 30,
+    "hint": "用于控制超大型游戏的扫描成本。达到上限时会提示统计为截断结果。"
+  },
+  "request_timeout": {
+    "description": "请求超时时间（秒）",
+    "type": "int",
+    "default": 20,
+    "hint": "Roblox API 偶尔波动，超时可适当加大。"
+  }
+}
