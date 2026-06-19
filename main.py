@@ -366,7 +366,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.1.2",
+    "0.1.3",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -375,7 +375,7 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.2"},
+            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.3"},
             follow_redirects=True,
         )
         self._request_lock = asyncio.Lock()
@@ -394,10 +394,15 @@ class RobloxGameSearchPlugin(Star):
         async for result in self._handle_search(event, search_mode="id"):
             yield result
 
+    @filter.command("游戏ID搜索")
+    async def game_id_search(self, event: AstrMessageEvent):
+        async for result in self._handle_search(event, search_mode="id"):
+            yield result
+
     async def _handle_search(self, event: AstrMessageEvent, search_mode: str):
         query_text = event.message_str or ""
-        command_name = "roblox游戏搜索" if search_mode == "name" else "roblox游戏ID搜索"
-        args = self._parse_command_args(query_text, command_name)
+        command_names = ["roblox游戏搜索"] if search_mode == "name" else ["roblox游戏ID搜索", "游戏ID搜索"]
+        args = self._parse_command_args(query_text, command_names)
 
         if not args["query"]:
             yield event.plain_result(self._usage_text(search_mode))
@@ -479,9 +484,10 @@ class RobloxGameSearchPlugin(Star):
             logger.exception("Roblox 游戏搜索插件执行失败: %s", exc)
             yield event.plain_result(f"查询失败：{exc}")
 
-    def _parse_command_args(self, message: str, command_name: str) -> dict[str, str | None]:
+    def _parse_command_args(self, message: str, command_names: list[str]) -> dict[str, str | None]:
         text = re.sub(r"^/+", "", (message or "").strip())
-        text = re.sub(rf"^{re.escape(command_name)}", "", text, count=1).strip()
+        commands_pattern = "|".join(re.escape(command_name) for command_name in command_names)
+        text = re.sub(rf"^(?:{commands_pattern})", "", text, count=1).strip()
 
         mode = None
         background = None
@@ -521,9 +527,10 @@ class RobloxGameSearchPlugin(Star):
             )
         return (
             "用法：/roblox游戏ID搜索 数字ID\n"
+            "别名：/游戏ID搜索 数字ID\n"
             "可选参数：--文本 | --图片 | --背景=自定义CSS背景\n"
             "示例：/roblox游戏ID搜索 6516141723\n"
-            "示例：/roblox游戏ID搜索 --文本 2440500124"
+            "示例：/游戏ID搜索 --文本 2440500124"
         )
 
     async def _resolve_game_by_name(self, query: str) -> RobloxGame | None:
