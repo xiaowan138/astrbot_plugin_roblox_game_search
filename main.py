@@ -21,6 +21,7 @@ GAME_VOTES_URL = "https://games.roblox.com/v1/games/votes"
 GAME_ICON_URL = "https://thumbnails.roblox.com/v1/games/icons"
 PLACE_TO_UNIVERSE_URL = "https://apis.roblox.com/universes/v1/places/{place_id}/universe"
 PUBLIC_SERVERS_URL = "https://games.roblox.com/v1/games/{place_id}/servers/Public"
+TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
 DEFAULT_BACKGROUND = (
     "radial-gradient(circle at top left, rgba(99, 102, 241, 0.35), transparent 28%), "
@@ -366,7 +367,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.1.6",
+    "0.1.7",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -375,7 +376,7 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.6"},
+            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.7"},
             follow_redirects=True,
         )
         self._request_lock = asyncio.Lock()
@@ -530,8 +531,8 @@ class RobloxGameSearchPlugin(Star):
     def _not_found_text(self, query: str) -> str:
         if re.search(r"[\u4e00-\u9fff]", query or ""):
             return (
-                "没有找到对应的 Roblox 游戏。Roblox 游戏名通常是英文，"
-                "可以试试英文名，或在插件配置 game_aliases 里添加中文名到英文名的映射。"
+                "没有找到对应的 Roblox 游戏。插件已经尝试中文别名、关键词翻译和英文候选搜索，"
+                "可以换一个更完整的游戏名再试。"
             )
         return "没有找到对应的 Roblox 游戏，请检查输入后再试。"
 
@@ -622,9 +623,36 @@ class RobloxGameSearchPlugin(Star):
         return await self._build_game(detail, votes, image_url, "", age_info)
 
     async def _search_game(self, query: str) -> dict[str, Any] | None:
-        search_query = self._resolve_alias_query(query)
-        candidates = await self._search_game_candidates(search_query)
-        return self._pick_best_search_hit(search_query, candidates)
+        search_queries = await self._build_search_queries(query)
+        candidates: list[dict[str, Any]] = []
+        seen_candidates: dict[str, dict[str, Any]] = {}
+
+        for query_index, search_query in enumerate(search_queries):
+            for candidate in await self._search_game_candidates(search_query):
+                candidate_key = str(candidate.get("universe_id") or candidate.get("root_place_id"))
+                if not candidate_key:
+                    continue
+
+                existing = seen_candidates.get(candidate_key)
+                if existing:
+                    existing["result_index"] = min(
+                        int(existing.get("result_index", 0)),
+                        int(candidate.get("result_index", 0)),
+                    )
+                    existing["_best_query_index"] = min(
+                        int(existing.get("_best_query_index", query_index)),
+                        query_index,
+                    )
+                    existing.setdefault("_matched_queries", []).append(search_query)
+                    continue
+
+                candidate = dict(candidate)
+                candidate["_best_query_index"] = query_index
+                candidate["_matched_queries"] = [search_query]
+                candidates.append(candidate)
+                seen_candidates[candidate_key] = candidate
+
+        return self._pick_best_search_hit(search_queries, candidates)
 
     async def _search_game_candidates(self, query: str) -> list[dict[str, Any]]:
         params = {
@@ -667,17 +695,19 @@ class RobloxGameSearchPlugin(Star):
 
     def _pick_best_search_hit(
         self,
-        query: str,
+        queries: str | list[str],
         candidates: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
         if not candidates:
             return None
 
-        query_norm = normalize_match_text(query)
-        query_key = compact_match_text(query)
-        query_acronym = query_key
+        target_queries = [queries] if isinstance(queries, str) else queries
+        target_queries = [normalize_text(query, "") for query in target_queries if normalize_text(query, "")]
 
-        def match_score(candidate: dict[str, Any]) -> float:
+        def single_match_score(query: str, candidate: dict[str, Any]) -> float:
+            query_norm = normalize_match_text(query)
+            query_key = compact_match_text(query)
+            query_acronym = query_key
             name = candidate.get("name", "")
             name_norm = normalize_match_text(name)
             name_key = compact_match_text(name)
@@ -702,6 +732,9 @@ class RobloxGameSearchPlugin(Star):
                 return 2600
             return SequenceMatcher(None, query_norm, name_norm).ratio() * 1500
 
+        def match_score(candidate: dict[str, Any]) -> float:
+            return max((single_match_score(query, candidate) for query in target_queries), default=0.0)
+
         def score(candidate: dict[str, Any]) -> float:
             base = match_score(candidate)
             if candidate.get("emphasis"):
@@ -714,6 +747,7 @@ class RobloxGameSearchPlugin(Star):
             base += min(math.log10(players + 1) * 130, 650)
             base += min(math.log10(up_votes + 1) * 70, 420)
             base -= int(candidate.get("result_index", 0)) * 2
+            base -= int(candidate.get("_best_query_index", 0)) * 20
             return base
 
         best = max(candidates, key=score)
@@ -723,21 +757,67 @@ class RobloxGameSearchPlugin(Star):
             return None
         return best
 
-    def _resolve_alias_query(self, query: str) -> str:
+    async def _build_search_queries(self, query: str) -> list[str]:
+        query_clean = normalize_text(query, "")
+        cleaned_query = self._cleanup_user_search_query(query_clean)
+        search_queries: list[str] = []
+
+        def add(value: str | None):
+            value = normalize_text(value, "")
+            if not value:
+                return
+            if compact_match_text(value) in {compact_match_text(item) for item in search_queries}:
+                return
+            search_queries.append(value)
+
+        if self._contains_chinese(query_clean):
+            for value in self._make_keyword_translation_queries(cleaned_query):
+                add(value)
+            for value in self._resolve_alias_queries(query_clean):
+                add(value)
+            for value in self._resolve_alias_queries(cleaned_query):
+                add(value)
+
+            translated_query = await self._translate_query_to_english(cleaned_query)
+            for value in self._english_query_variants(translated_query):
+                add(value)
+
+            add(cleaned_query)
+            add(query_clean)
+        else:
+            add(query_clean)
+            add(cleaned_query)
+            for value in self._resolve_alias_queries(query_clean):
+                add(value)
+            for value in self._resolve_alias_queries(cleaned_query):
+                add(value)
+
+        max_queries = max(1, int(self.config.get("max_search_queries", 6)))
+        return search_queries[:max_queries]
+
+    def _resolve_alias_queries(self, query: str) -> list[str]:
         query_clean = normalize_text(query, "")
         query_key = compact_match_text(query_clean)
         raw_aliases = {
+            "史诗迷你游戏": "Epic Minigames",
+            "史诗小游戏": "Epic Minigames",
+            "史诗迷你小游戏": "Epic Minigames",
             "布鲁克海文": "Brookhaven",
+            "布鲁克海文rp": "Brookhaven",
+            "布鲁克黑文": "Brookhaven",
             "brookhaven": "Brookhaven",
             "doors": "DOORS",
             "门": "DOORS",
+            "门2": "DOORS",
             "压力": "Pressure",
             "自然灾害": "Natural Disaster Survival",
             "自然灾害模拟器": "Natural Disaster Survival",
+            "自然灾害生存": "Natural Disaster Survival",
             "忍者传奇": "Ninja Legends",
             "力量传奇": "Legends Of Speed",
             "速度传奇": "Legends Of Speed",
             "收养我": "Adopt Me",
+            "领养我": "Adopt Me",
             "宠物模拟器": "Pet Simulator",
             "宠物模拟器99": "Pet Simulator 99",
             "蜂群模拟器": "Bee Swarm Simulator",
@@ -753,12 +833,15 @@ class RobloxGameSearchPlugin(Star):
             "动漫防御": "Anime Defenders",
             "水果": "Blox Fruits",
             "方块水果": "Blox Fruits",
+            "恶魔果实": "Blox Fruits",
             "bloxfruit": "Blox Fruits",
             "bloxfruits": "Blox Fruits",
             "地狱塔": "Tower of Hell",
             "塔狱": "Tower of Hell",
             "餐厅大亨": "Restaurant Tycoon 2",
             "主题公园大亨": "Theme Park Tycoon 2",
+            "伐木大亨2": "Lumber Tycoon 2",
+            "木材大亨2": "Lumber Tycoon 2",
             "载具传奇": "Vehicle Legends",
             "矿工天堂": "Miner's Haven",
             "铁路": "Stepford County Railway",
@@ -778,7 +861,164 @@ class RobloxGameSearchPlugin(Star):
                 if alias_key and target_text:
                     aliases[alias_key] = target_text
 
-        return aliases.get(query_key, query_clean)
+        resolved: list[str] = []
+        if query_key in aliases:
+            resolved.append(aliases[query_key])
+        return resolved
+
+    def _cleanup_user_search_query(self, query: str) -> str:
+        text = normalize_text(query, "")
+        text = re.sub(r"(?i)\broblox\b", " ", text)
+        text = text.replace("罗布乐思", " ").replace("罗布勒斯", " ")
+        text = re.sub(r"[的：:，,。!！?？]+", " ", text)
+        return normalize_text(" ".join(text.split()), query)
+
+    def _contains_chinese(self, text: str) -> bool:
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+    def _make_keyword_translation_queries(self, query: str) -> list[str]:
+        text = re.sub(r"\s+", "", normalize_text(query, ""))
+        if not text:
+            return []
+
+        phrases = {
+            "史诗迷你游戏": "Epic Minigames",
+            "史诗小游戏": "Epic Minigames",
+            "迷你游戏": "Minigames",
+            "小游戏": "Minigames",
+            "布鲁克海文": "Brookhaven",
+            "布鲁克黑文": "Brookhaven",
+            "自然灾害": "Natural Disaster",
+            "灾害生存": "Disaster Survival",
+            "宠物模拟器": "Pet Simulator",
+            "主题公园": "Theme Park",
+            "餐厅大亨": "Restaurant Tycoon",
+            "伐木大亨": "Lumber Tycoon",
+            "木材大亨": "Lumber Tycoon",
+            "地狱塔": "Tower of Hell",
+            "彩虹朋友": "Rainbow Friends",
+            "蜂群": "Bee Swarm",
+            "鱿鱼游戏": "Squid Game",
+            "战争大亨": "War Tycoon",
+            "动漫冒险": "Anime Adventures",
+            "动漫防御": "Anime Defenders",
+            "火车模拟器": "Train Simulator",
+            "模拟器": "Simulator",
+            "大亨": "Tycoon",
+            "传奇": "Legends",
+            "生存": "Survival",
+            "冒险": "Adventure",
+            "防御": "Defense",
+            "战争": "War",
+            "速度": "Speed",
+            "力量": "Power",
+            "水果": "Fruits",
+            "方块": "Blox",
+            "塔": "Tower",
+            "门": "Doors",
+            "铁路": "Railway",
+            "火车": "Train",
+            "车辆": "Vehicle",
+            "载具": "Vehicle",
+            "餐厅": "Restaurant",
+            "主题": "Theme",
+            "公园": "Park",
+            "宠物": "Pet",
+            "蜂": "Bee",
+            "群": "Swarm",
+            "忍者": "Ninja",
+            "谋杀": "Murder",
+            "神秘": "Mystery",
+            "自然": "Natural",
+            "灾害": "Disaster",
+            "史诗": "Epic",
+            "迷你": "Mini",
+            "游戏": "Games",
+        }
+        phrase_keys = sorted(phrases, key=len, reverse=True)
+        tokens: list[str] = []
+        unknown_chinese = 0
+        index = 0
+
+        while index < len(text):
+            matched_key = next((key for key in phrase_keys if text.startswith(key, index)), None)
+            if matched_key:
+                tokens.append(phrases[matched_key])
+                index += len(matched_key)
+                continue
+
+            char = text[index]
+            if char.isascii() and char.isalnum():
+                end = index + 1
+                while end < len(text) and text[end].isascii() and text[end].isalnum():
+                    end += 1
+                tokens.append(text[index:end])
+                index = end
+                continue
+
+            if self._contains_chinese(char):
+                unknown_chinese += 1
+            index += 1
+
+        if not tokens or unknown_chinese > max(2, len(tokens)):
+            return []
+
+        translated = " ".join(tokens)
+        return self._english_query_variants(translated)
+
+    async def _translate_query_to_english(self, query: str) -> str:
+        if not self.config.get("enable_online_translation", True):
+            return ""
+        if not self._contains_chinese(query):
+            return ""
+
+        params = {
+            "client": "gtx",
+            "sl": "zh-CN",
+            "tl": "en",
+            "dt": "t",
+            "q": query,
+        }
+        try:
+            await self._wait_for_request_slot()
+            response = await self.client.get(TRANSLATE_URL, params=params)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, list) or not data or not isinstance(data[0], list):
+                return ""
+            translated = "".join(
+                str(part[0])
+                for part in data[0]
+                if isinstance(part, list) and part and part[0]
+            )
+            return self._normalize_translated_query(translated)
+        except Exception:
+            return ""
+
+    def _normalize_translated_query(self, query: str) -> str:
+        text = normalize_text(query, "")
+        text = re.sub(r"(?i)\broblox\b", " ", text)
+        text = re.sub(r"(?i)\bgame\s+of\b", " ", text)
+        text = re.sub(r"(?i)\bthe\b", " ", text)
+        return normalize_text(" ".join(text.split()), "")
+
+    def _english_query_variants(self, query: str) -> list[str]:
+        query = normalize_text(query, "")
+        if not query:
+            return []
+
+        variants = [query]
+        replacements = (
+            ("Mini Games", "Minigames"),
+            ("Mini Game", "Minigames"),
+            ("mini games", "Minigames"),
+            ("mini game", "Minigames"),
+            ("Tycoon 2", "Tycoon 2"),
+        )
+        for old, new in replacements:
+            if old in query:
+                variants.append(query.replace(old, new))
+        return variants
 
     async def _fetch_age_info(self, universe_id: int, name: str) -> dict[str, Any]:
         if not name:

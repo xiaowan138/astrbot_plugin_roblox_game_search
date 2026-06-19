@@ -61,7 +61,19 @@
     "type": "object",
     "default": {},
     "items": {},
-    "hint": "用于把中文名、简称映射到 Roblox 英文游戏名，例如 {\"布鲁克海文\":\"Brookhaven\", \"铁路\":\"Stepford County Railway\"}。"
+    "hint": "可选兜底配置。插件会先自动处理常见中文名和关键词翻译，这里用于补充未内置的私有叫法，例如 {\"布鲁克海文\":\"Brookhaven\"}。"
+  },
+  "max_search_queries": {
+    "description": "自动搜索候选数量上限",
+    "type": "int",
+    "default": 6,
+    "hint": "中文搜索会自动生成多个英文候选并逐个搜索。数值越大越容易搜到，但请求更多。建议 4 到 8。"
+  },
+  "enable_online_translation": {
+    "description": "启用中文在线翻译兜底",
+    "type": "bool",
+    "default": true,
+    "hint": "中文名没有命中内置别名和关键词规则时，尝试通过翻译接口生成英文搜索候选。关闭后只使用内置规则。"
   },
   "request_timeout": {
     "description": "请求超时时间（秒）",
