@@ -4,6 +4,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 import httpx
@@ -335,6 +336,17 @@ def normalize_text(value: str | None, fallback: str) -> str:
     return cleaned if cleaned else fallback
 
 
+def normalize_match_text(value: str | None) -> str:
+    text = normalize_text(value, "").casefold()
+    text = re.sub(r"[\[\(【（].*?[\]\)】）]", " ", text)
+    normalized = "".join(char if char.isalnum() else " " for char in text)
+    return " ".join(normalized.split())
+
+
+def compact_match_text(value: str | None) -> str:
+    return normalize_match_text(value).replace(" ", "")
+
+
 def summarize_status(playing: int, max_players: int) -> str:
     if max_players <= 0:
         return "未知"
@@ -354,7 +366,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.1.1",
+    "0.1.2",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -363,7 +375,7 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.1"},
+            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.2"},
             follow_redirects=True,
         )
         self._request_lock = asyncio.Lock()
@@ -551,6 +563,10 @@ class RobloxGameSearchPlugin(Star):
         return await self._build_game(detail, votes, image_url, "", age_info)
 
     async def _search_game(self, query: str) -> dict[str, Any] | None:
+        candidates = await self._search_game_candidates(query)
+        return self._pick_best_search_hit(query, candidates)
+
+    async def _search_game_candidates(self, query: str) -> list[dict[str, Any]]:
         params = {
             "searchQuery": query,
             "pageToken": "",
@@ -558,6 +574,8 @@ class RobloxGameSearchPlugin(Star):
             "pageType": "all",
         }
         payload = await self._get_json(OMNI_SEARCH_URL, params=params)
+        candidates: list[dict[str, Any]] = []
+        index = 0
         for block in payload.get("searchResults", []):
             if block.get("contentGroupType") != "Game":
                 continue
@@ -565,25 +583,80 @@ class RobloxGameSearchPlugin(Star):
                 universe_id = content.get("universeId") or content.get("contentId")
                 root_place_id = content.get("rootPlaceId")
                 if universe_id and root_place_id:
-                    return {
+                    candidates.append({
                         "universe_id": int(universe_id),
                         "root_place_id": int(root_place_id),
+                        "name": normalize_text(content.get("name"), ""),
                         "description": normalize_text(content.get("description"), "暂无简介。"),
+                        "creator_name": normalize_text(content.get("creatorName"), ""),
+                        "player_count": int(content.get("playerCount", 0) or 0),
+                        "total_up_votes": int(content.get("totalUpVotes", 0) or 0),
+                        "total_down_votes": int(content.get("totalDownVotes", 0) or 0),
+                        "emphasis": bool(content.get("emphasis", False)),
+                        "is_sponsored": bool(content.get("isSponsored", False)),
+                        "result_index": index,
                         "age_recommendation": normalize_text(
                             content.get("ageRecommendationDisplayName"),
                             "",
                         ),
                         "content_maturity": normalize_text(content.get("contentMaturity"), ""),
                         "minimum_age": int(content.get("minimumAge", 0) or 0),
-                    }
-        return None
+                    })
+                    index += 1
+        return candidates
+
+    def _pick_best_search_hit(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not candidates:
+            return None
+
+        query_norm = normalize_match_text(query)
+        query_key = compact_match_text(query)
+
+        def score(candidate: dict[str, Any]) -> float:
+            name = candidate.get("name", "")
+            name_norm = normalize_match_text(name)
+            name_key = compact_match_text(name)
+            base = 0.0
+
+            if query_norm and name_norm == query_norm:
+                base += 10000
+            elif query_key and name_key == query_key:
+                base += 9500
+            elif query_norm and name_norm.startswith(query_norm):
+                base += 5200
+            elif query_key and name_key.startswith(query_key):
+                base += 4800
+            elif query_norm and f" {query_norm} " in f" {name_norm} ":
+                base += 3400
+            elif query_key and query_key in name_key:
+                base += 2600
+            else:
+                base += SequenceMatcher(None, query_norm, name_norm).ratio() * 1500
+
+            if candidate.get("emphasis"):
+                base += 450
+            if candidate.get("is_sponsored"):
+                base -= 1600
+
+            players = max(0, int(candidate.get("player_count", 0) or 0))
+            up_votes = max(0, int(candidate.get("total_up_votes", 0) or 0))
+            base += min(math.log10(players + 1) * 130, 650)
+            base += min(math.log10(up_votes + 1) * 70, 420)
+            base -= int(candidate.get("result_index", 0)) * 2
+            return base
+
+        return max(candidates, key=score)
 
     async def _fetch_age_info(self, universe_id: int, name: str) -> dict[str, Any]:
         if not name:
             return {}
-        search_hit = await self._search_game(name)
-        if search_hit and int(search_hit.get("universe_id", 0)) == universe_id:
-            return search_hit
+        for search_hit in await self._search_game_candidates(name):
+            if int(search_hit.get("universe_id", 0)) == universe_id:
+                return search_hit
         return {}
 
     async def _fetch_game_detail(self, universe_id: int) -> dict[str, Any] | None:
