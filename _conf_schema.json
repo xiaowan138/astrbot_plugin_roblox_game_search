@@ -50,6 +50,12 @@
     "default": 3000,
     "hint": "每次 429 后等待的基础时长。"
   },
+  "name_match_min_score": {
+    "description": "游戏名搜索最低匹配分",
+    "type": "int",
+    "default": 2200,
+    "hint": "候选游戏名低于该匹配分时不返回结果，避免 Roblox 搜索给出不相关游戏。调低会更宽松，调高会更严格。"
+  },
   "request_timeout": {
     "description": "请求超时时间（秒）",
     "type": "int",

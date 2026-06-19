@@ -366,7 +366,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.1.3",
+    "0.1.4",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -375,7 +375,7 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.3"},
+            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.4"},
             follow_redirects=True,
         )
         self._request_lock = asyncio.Lock()
@@ -386,6 +386,11 @@ class RobloxGameSearchPlugin(Star):
 
     @filter.command("roblox游戏搜索")
     async def roblox_game_search(self, event: AstrMessageEvent):
+        async for result in self._handle_search(event, search_mode="name"):
+            yield result
+
+    @filter.command("游戏搜索")
+    async def game_search(self, event: AstrMessageEvent):
         async for result in self._handle_search(event, search_mode="name"):
             yield result
 
@@ -401,7 +406,11 @@ class RobloxGameSearchPlugin(Star):
 
     async def _handle_search(self, event: AstrMessageEvent, search_mode: str):
         query_text = event.message_str or ""
-        command_names = ["roblox游戏搜索"] if search_mode == "name" else ["roblox游戏ID搜索", "游戏ID搜索"]
+        command_names = (
+            ["roblox游戏搜索", "游戏搜索"]
+            if search_mode == "name"
+            else ["roblox游戏ID搜索", "游戏ID搜索"]
+        )
         args = self._parse_command_args(query_text, command_names)
 
         if not args["query"]:
@@ -521,9 +530,10 @@ class RobloxGameSearchPlugin(Star):
         if search_mode == "name":
             return (
                 "用法：/roblox游戏搜索 游戏名\n"
+                "别名：/游戏搜索 游戏名\n"
                 "可选参数：--文本 | --图片 | --背景=自定义CSS背景\n"
                 "示例：/roblox游戏搜索 doors\n"
-                "示例：/roblox游戏搜索 --文本 Blox Fruits"
+                "示例：/游戏搜索 --文本 Blox Fruits"
             )
         return (
             "用法：/roblox游戏ID搜索 数字ID\n"
@@ -623,27 +633,27 @@ class RobloxGameSearchPlugin(Star):
         query_norm = normalize_match_text(query)
         query_key = compact_match_text(query)
 
-        def score(candidate: dict[str, Any]) -> float:
+        def match_score(candidate: dict[str, Any]) -> float:
             name = candidate.get("name", "")
             name_norm = normalize_match_text(name)
             name_key = compact_match_text(name)
-            base = 0.0
 
             if query_norm and name_norm == query_norm:
-                base += 10000
-            elif query_key and name_key == query_key:
-                base += 9500
-            elif query_norm and name_norm.startswith(query_norm):
-                base += 5200
-            elif query_key and name_key.startswith(query_key):
-                base += 4800
-            elif query_norm and f" {query_norm} " in f" {name_norm} ":
-                base += 3400
-            elif query_key and query_key in name_key:
-                base += 2600
-            else:
-                base += SequenceMatcher(None, query_norm, name_norm).ratio() * 1500
+                return 10000
+            if query_key and name_key == query_key:
+                return 9500
+            if query_norm and name_norm.startswith(query_norm):
+                return 5200
+            if query_key and name_key.startswith(query_key):
+                return 4800
+            if query_norm and f" {query_norm} " in f" {name_norm} ":
+                return 3400
+            if query_key and query_key in name_key:
+                return 2600
+            return SequenceMatcher(None, query_norm, name_norm).ratio() * 1500
 
+        def score(candidate: dict[str, Any]) -> float:
+            base = match_score(candidate)
             if candidate.get("emphasis"):
                 base += 450
             if candidate.get("is_sponsored"):
@@ -656,7 +666,12 @@ class RobloxGameSearchPlugin(Star):
             base -= int(candidate.get("result_index", 0)) * 2
             return base
 
-        return max(candidates, key=score)
+        best = max(candidates, key=score)
+        best_match = match_score(best)
+        min_match_score = float(self.config.get("name_match_min_score", 2200))
+        if best_match < min_match_score:
+            return None
+        return best
 
     async def _fetch_age_info(self, universe_id: int, name: str) -> dict[str, Any]:
         if not name:
