@@ -366,7 +366,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.1.4",
+    "0.1.5",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -375,11 +375,12 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.4"},
+            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.5"},
             follow_redirects=True,
         )
         self._request_lock = asyncio.Lock()
         self._last_request_ts = 0.0
+        self._recent_event_keys: dict[str, float] = {}
 
     async def terminate(self):
         await self.client.aclose()
@@ -405,6 +406,9 @@ class RobloxGameSearchPlugin(Star):
             yield result
 
     async def _handle_search(self, event: AstrMessageEvent, search_mode: str):
+        if self._is_duplicate_event(event, search_mode):
+            return
+
         query_text = event.message_str or ""
         command_names = (
             ["roblox游戏搜索", "游戏搜索"]
@@ -435,7 +439,7 @@ class RobloxGameSearchPlugin(Star):
                 game = await self._resolve_game_by_id(int(args["query"]))
 
             if not game:
-                yield event.plain_result("没有找到对应的 Roblox 游戏，请检查输入后再试。")
+                yield event.plain_result(self._not_found_text(args["query"]))
                 return
 
             display_limit = max(1, int(self.config.get("server_display_limit", 10)))
@@ -492,6 +496,44 @@ class RobloxGameSearchPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.exception("Roblox 游戏搜索插件执行失败: %s", exc)
             yield event.plain_result(f"查询失败：{exc}")
+
+    def _is_duplicate_event(self, event: AstrMessageEvent, search_mode: str) -> bool:
+        raw_message = event.message_str or ""
+        event_extra_key = f"roblox_game_search_handled:{search_mode}:{raw_message}"
+        if event.get_extra(event_extra_key):
+            return True
+        event.set_extra(event_extra_key, True)
+
+        now = time.monotonic()
+        ttl_seconds = 5.0
+        cutoff = now - ttl_seconds
+        if len(self._recent_event_keys) > 120:
+            self._recent_event_keys = {
+                key: ts for key, ts in self._recent_event_keys.items() if ts >= cutoff
+            }
+
+        message_obj = getattr(event, "message_obj", None)
+        message_id = getattr(message_obj, "message_id", "") or getattr(message_obj, "id", "")
+        sender_id = (
+            getattr(message_obj, "sender_id", "")
+            or getattr(message_obj, "sender", "")
+            or getattr(message_obj, "user_id", "")
+        )
+        origin = getattr(event, "unified_msg_origin", "") or getattr(event, "session_id", "")
+        dedupe_key = f"{search_mode}:{origin}:{sender_id}:{message_id}:{raw_message}"
+        last_seen = self._recent_event_keys.get(dedupe_key)
+        if last_seen and last_seen >= cutoff:
+            return True
+        self._recent_event_keys[dedupe_key] = now
+        return False
+
+    def _not_found_text(self, query: str) -> str:
+        if re.search(r"[\u4e00-\u9fff]", query or ""):
+            return (
+                "没有找到对应的 Roblox 游戏。Roblox 游戏名通常是英文，"
+                "可以试试英文名，或在插件配置 game_aliases 里添加中文名到英文名的映射。"
+            )
+        return "没有找到对应的 Roblox 游戏，请检查输入后再试。"
 
     def _parse_command_args(self, message: str, command_names: list[str]) -> dict[str, str | None]:
         text = re.sub(r"^/+", "", (message or "").strip())
@@ -580,8 +622,9 @@ class RobloxGameSearchPlugin(Star):
         return await self._build_game(detail, votes, image_url, "", age_info)
 
     async def _search_game(self, query: str) -> dict[str, Any] | None:
-        candidates = await self._search_game_candidates(query)
-        return self._pick_best_search_hit(query, candidates)
+        search_query = self._resolve_alias_query(query)
+        candidates = await self._search_game_candidates(search_query)
+        return self._pick_best_search_hit(search_query, candidates)
 
     async def _search_game_candidates(self, query: str) -> list[dict[str, Any]]:
         params = {
@@ -632,20 +675,27 @@ class RobloxGameSearchPlugin(Star):
 
         query_norm = normalize_match_text(query)
         query_key = compact_match_text(query)
+        query_acronym = query_key
 
         def match_score(candidate: dict[str, Any]) -> float:
             name = candidate.get("name", "")
             name_norm = normalize_match_text(name)
             name_key = compact_match_text(name)
+            name_words = name_norm.split()
+            name_acronym = "".join(word[0] for word in name_words if word)
 
             if query_norm and name_norm == query_norm:
                 return 10000
             if query_key and name_key == query_key:
                 return 9500
+            if query_acronym and len(query_acronym) >= 2 and name_acronym == query_acronym:
+                return 9000
             if query_norm and name_norm.startswith(query_norm):
                 return 5200
             if query_key and name_key.startswith(query_key):
                 return 4800
+            if query_acronym and len(query_acronym) >= 2 and name_acronym.startswith(query_acronym):
+                return 4600
             if query_norm and f" {query_norm} " in f" {name_norm} ":
                 return 3400
             if query_key and query_key in name_key:
@@ -672,6 +722,63 @@ class RobloxGameSearchPlugin(Star):
         if best_match < min_match_score:
             return None
         return best
+
+    def _resolve_alias_query(self, query: str) -> str:
+        query_clean = normalize_text(query, "")
+        query_key = compact_match_text(query_clean)
+        raw_aliases = {
+            "布鲁克海文": "Brookhaven",
+            "brookhaven": "Brookhaven",
+            "doors": "DOORS",
+            "门": "DOORS",
+            "压力": "Pressure",
+            "自然灾害": "Natural Disaster Survival",
+            "自然灾害模拟器": "Natural Disaster Survival",
+            "忍者传奇": "Ninja Legends",
+            "力量传奇": "Legends Of Speed",
+            "速度传奇": "Legends Of Speed",
+            "收养我": "Adopt Me",
+            "宠物模拟器": "Pet Simulator",
+            "宠物模拟器99": "Pet Simulator 99",
+            "蜂群模拟器": "Bee Swarm Simulator",
+            "兵工厂": "Arsenal",
+            "越狱": "Jailbreak",
+            "杀手": "Murder Mystery 2",
+            "谋杀神秘2": "Murder Mystery 2",
+            "彩虹朋友": "Rainbow Friends",
+            "鱿鱼游戏": "Squid Game",
+            "床战": "BedWars",
+            "战争大亨": "War Tycoon",
+            "动漫冒险": "Anime Adventures",
+            "动漫防御": "Anime Defenders",
+            "水果": "Blox Fruits",
+            "方块水果": "Blox Fruits",
+            "bloxfruit": "Blox Fruits",
+            "bloxfruits": "Blox Fruits",
+            "地狱塔": "Tower of Hell",
+            "塔狱": "Tower of Hell",
+            "餐厅大亨": "Restaurant Tycoon 2",
+            "主题公园大亨": "Theme Park Tycoon 2",
+            "载具传奇": "Vehicle Legends",
+            "矿工天堂": "Miner's Haven",
+            "铁路": "Stepford County Railway",
+            "火车模拟器": "Stepford County Railway",
+            "scr": "Stepford County Railway",
+        }
+        aliases = {
+            compact_match_text(alias): target
+            for alias, target in raw_aliases.items()
+            if compact_match_text(alias)
+        }
+        user_aliases = self.config.get("game_aliases", {})
+        if isinstance(user_aliases, dict):
+            for alias, target in user_aliases.items():
+                alias_key = compact_match_text(str(alias))
+                target_text = normalize_text(str(target), "")
+                if alias_key and target_text:
+                    aliases[alias_key] = target_text
+
+        return aliases.get(query_key, query_clean)
 
     async def _fetch_age_info(self, universe_id: int, name: str) -> dict[str, Any]:
         if not name:

@@ -2,7 +2,7 @@ name: astrbot_plugin_roblox_game_search
 display_name: Roblox 游戏搜索
 desc: 通过 /roblox游戏搜索 指令查询 Roblox 游戏详情、好评率和公开服务器状态。
 short_desc: 搜索 Roblox 游戏并输出文本或 HTML 生图。
-version: v0.1.4
+version: v0.1.5
 author: xiaowan
 repo: https://github.com/xiaowan138/astrbot_plugin_roblox_game_search
 astrbot_version: ">=4.16,<5"
