@@ -366,7 +366,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.1.5",
+    "0.1.6",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -375,7 +375,7 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.5"},
+            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.6"},
             follow_redirects=True,
         )
         self._request_lock = asyncio.Lock()

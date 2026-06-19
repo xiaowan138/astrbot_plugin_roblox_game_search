@@ -58,7 +58,7 @@
   },
   "game_aliases": {
     "description": "游戏名别名映射",
-    "type": "dict",
+    "type": "object",
     "default": {},
     "items": {},
     "hint": "用于把中文名、简称映射到 Roblox 英文游戏名，例如 {\"布鲁克海文\":\"Brookhaven\", \"铁路\":\"Stepford County Railway\"}。"
