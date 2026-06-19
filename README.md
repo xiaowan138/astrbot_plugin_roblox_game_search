@@ -1,15 +1,30 @@
 # astrbot_plugin_roblox_game_search
 
-一个 AstrBot 初版插件，通过 `/roblox游戏搜索` 指令查询 Roblox 游戏信息。
+一个 AstrBot 插件，通过两个指令查询 Roblox 游戏信息。
+
+## 指令
+
+```text
+/roblox游戏搜索 游戏名
+/roblox游戏ID搜索 数字ID
+```
+
+可选参数：
+
+```text
+--文本
+--图片
+--背景=CSS背景
+--服务器数=10
+```
 
 ## 功能
 
-- 支持按 `游戏名` 搜索。
-- 支持按纯数字 `ID` 搜索，兼容 `universeId` 和 `placeId`。
-- 输出单条消息，可选：
-  - `HTML 生图`
-  - `纯文本`
-- 展示字段：
+- `/roblox游戏搜索` 只按游戏名搜索。
+- `/roblox游戏ID搜索` 只按纯数字 ID 搜索，兼容 `universeId` 和 `placeId`。
+- 支持文本和 HTML 生图两种输出。
+- 文本模式会直接发送图片组件，不再发图片链接。
+- 展示字段包含：
   - 游戏名
   - 游戏图片
   - 游戏简介
@@ -20,23 +35,23 @@
   - 公开服务器统计
   - 服务器状态 / 人数 / 延迟 / FPS
 
-## 指令
+## 限流设置
 
-```text
-/roblox游戏搜索 ID/游戏名
-/roblox游戏搜索 --文本 ID/游戏名
-/roblox游戏搜索 --图片 ID/游戏名
-/roblox游戏搜索 --背景=linear-gradient(135deg,#0f172a,#1d4ed8) 游戏名
-```
+这一版增加了请求节奏控制，避免一下子请求过多：
 
-## 说明
+- 所有 Roblox API 请求按最小间隔串行发送
+- 遇到 `429 Too Many Requests` 会自动退避重试
+- 服务器分页默认缩小
+- 服务器扫描页数默认降低
+- 如果服务器接口还是被限流，会返回部分统计结果，而不是整条查询失败
 
-- 本插件基于roblox api调用开发
-- roblox游戏官网：https://roblox.com
-- 初版默认返回搜索结果里的第一个游戏。
-- 文本模式会直接发送图片组件，不再输出图片链接。
-- 为了保证单条消息可读性，服务器列表默认只展示延迟较优的前 `N` 个。
-- 对于超大型游戏，公开服务器统计可能会在扫描上限处截断，插件会在消息底部说明。
+对应配置见 `_conf_schema.json`：
+
+- `min_request_interval_ms`
+- `retry_429_count`
+- `retry_429_backoff_ms`
+- `server_page_size`
+- `server_scan_page_limit`
 
 ## 安装
 

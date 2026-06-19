@@ -4,7 +4,7 @@
     "type": "string",
     "default": "html",
     "options": ["html", "text"],
-    "hint": "html 为单条图片消息，text 为单条纯文本消息。"
+    "hint": "html 为单条图片消息，text 为图文同发的一条消息链。"
   },
   "html_background": {
     "description": "HTML 生图背景",
@@ -17,25 +17,43 @@
   "server_display_limit": {
     "description": "消息内展示的服务器数量",
     "type": "int",
-    "default": 15,
-    "hint": "为了避免单条消息过长，初版默认只展示延迟最优的前 N 个服务器。"
+    "default": 10,
+    "hint": "只展示排序后最适合阅读的一部分服务器。"
   },
   "server_page_size": {
-    "description": "每次拉取公开服务器的分页大小",
-    "type": "int",
-    "default": 100,
-    "hint": "Roblox API 单次最多 100，通常保持默认即可。"
-  },
-  "server_scan_page_limit": {
-    "description": "公开服务器扫描页数上限",
+    "description": "每次拉取服务器的分页大小",
     "type": "int",
     "default": 30,
-    "hint": "用于控制超大型游戏的扫描成本。达到上限时会提示统计为截断结果。"
+    "hint": "数值越小越不容易触发限流，但统计会更慢。建议 20 到 50。"
+  },
+  "server_scan_page_limit": {
+    "description": "服务器扫描页数上限",
+    "type": "int",
+    "default": 5,
+    "hint": "限制总请求数，避免大热门游戏触发 429。"
+  },
+  "min_request_interval_ms": {
+    "description": "请求最小间隔（毫秒）",
+    "type": "int",
+    "default": 500,
+    "hint": "所有 Roblox API 请求会按这个最小间隔串行发送。"
+  },
+  "retry_429_count": {
+    "description": "429 重试次数",
+    "type": "int",
+    "default": 2,
+    "hint": "遇到 Roblox 限流时最多重试几次。"
+  },
+  "retry_429_backoff_ms": {
+    "description": "429 重试退避（毫秒）",
+    "type": "int",
+    "default": 3000,
+    "hint": "每次 429 后等待的基础时长。"
   },
   "request_timeout": {
     "description": "请求超时时间（秒）",
     "type": "int",
     "default": 20,
-    "hint": "Roblox API 偶尔波动，超时可适当加大。"
+    "hint": "Roblox API 波动较大时可以适当调高。"
   }
 }

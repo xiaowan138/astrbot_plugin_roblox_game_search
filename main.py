@@ -1,6 +1,7 @@
 import asyncio
 import math
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -26,7 +27,7 @@ DEFAULT_BACKGROUND = (
     "linear-gradient(135deg, #111827 0%, #0f172a 52%, #111827 100%)"
 )
 
-HTML_TEMPLATE = r"""
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -75,7 +76,6 @@ HTML_TEMPLATE = r"""
       font-weight: 800;
       line-height: 1.1;
       margin: 0 0 14px 0;
-      letter-spacing: 0;
     }
     .desc {
       font-size: 18px;
@@ -245,6 +245,10 @@ HTML_TEMPLATE = r"""
 """
 
 
+class RobloxRateLimitError(RuntimeError):
+    pass
+
+
 @dataclass
 class RobloxServer:
     id: str
@@ -349,8 +353,8 @@ def summarize_status(playing: int, max_players: int) -> str:
 @register(
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
-    "通过 /roblox游戏搜索 指令查询 Roblox 游戏详情与服务器信息。",
-    "0.1.0",
+    "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
+    "0.1.1",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -359,34 +363,56 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "AstrBot-Roblox-Search/0.1"},
+            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.1"},
             follow_redirects=True,
         )
+        self._request_lock = asyncio.Lock()
+        self._last_request_ts = 0.0
 
     async def terminate(self):
         await self.client.aclose()
 
     @filter.command("roblox游戏搜索")
     async def roblox_game_search(self, event: AstrMessageEvent):
+        async for result in self._handle_search(event, search_mode="name"):
+            yield result
+
+    @filter.command("roblox游戏ID搜索")
+    async def roblox_game_id_search(self, event: AstrMessageEvent):
+        async for result in self._handle_search(event, search_mode="id"):
+            yield result
+
+    async def _handle_search(self, event: AstrMessageEvent, search_mode: str):
         query_text = event.message_str or ""
-        args = self._parse_command_args(query_text)
+        command_name = "roblox游戏搜索" if search_mode == "name" else "roblox游戏ID搜索"
+        args = self._parse_command_args(query_text, command_name)
 
         if not args["query"]:
-            yield event.plain_result(self._usage_text())
+            yield event.plain_result(self._usage_text(search_mode))
+            return
+
+        if search_mode == "name" and args["query"].isdigit():
+            yield event.plain_result("这个指令用于按游戏名搜索。纯数字 ID 请使用 /roblox游戏ID搜索。")
+            return
+
+        if search_mode == "id" and not args["query"].isdigit():
+            yield event.plain_result("这个指令只接受纯数字 ID。游戏名请使用 /roblox游戏搜索。")
             return
 
         render_mode = args["mode"] or str(self.config.get("default_render_mode", "html")).lower()
-        background = args["background"] or str(
-            self.config.get("html_background", DEFAULT_BACKGROUND)
-        )
+        background = args["background"] or str(self.config.get("html_background", DEFAULT_BACKGROUND))
 
         try:
-            game = await self._resolve_game(args["query"])
+            if search_mode == "name":
+                game = await self._resolve_game_by_name(args["query"])
+            else:
+                game = await self._resolve_game_by_id(int(args["query"]))
+
             if not game:
-                yield event.plain_result("没有找到对应的 Roblox 游戏。请换一个 ID 或游戏名试试。")
+                yield event.plain_result("没有找到对应的 Roblox 游戏，请检查输入后再试。")
                 return
 
-            display_limit = max(1, int(self.config.get("server_display_limit", 15)))
+            display_limit = max(1, int(self.config.get("server_display_limit", 10)))
             if args["servers"]:
                 display_limit = max(1, int(args["servers"]))
             display_servers = sorted(
@@ -435,13 +461,15 @@ class RobloxGameSearchPlugin(Star):
                 options={"type": "png", "full_page": True, "animations": "disabled"},
             )
             yield event.image_result(image_url)
+        except RobloxRateLimitError:
+            yield event.plain_result("Roblox 接口限流了，插件已放慢请求节奏。请稍等几十秒后再试。")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Roblox 游戏搜索插件执行失败: %s", exc)
             yield event.plain_result(f"查询失败：{exc}")
 
-    def _parse_command_args(self, message: str) -> dict[str, str | None]:
+    def _parse_command_args(self, message: str, command_name: str) -> dict[str, str | None]:
         text = re.sub(r"^/+", "", (message or "").strip())
-        text = re.sub(r"^roblox游戏搜索", "", text, count=1).strip()
+        text = re.sub(rf"^{re.escape(command_name)}", "", text, count=1).strip()
 
         mode = None
         background = None
@@ -471,70 +499,55 @@ class RobloxGameSearchPlugin(Star):
             "servers": server_match.group(1) if server_match else None,
         }
 
-    def _usage_text(self) -> str:
+    def _usage_text(self, search_mode: str) -> str:
+        if search_mode == "name":
+            return (
+                "用法：/roblox游戏搜索 游戏名\n"
+                "可选参数：--文本 | --图片 | --背景=自定义CSS背景\n"
+                "示例：/roblox游戏搜索 doors\n"
+                "示例：/roblox游戏搜索 --文本 Blox Fruits"
+            )
         return (
-            "用法：/roblox游戏搜索 ID/游戏名\n"
+            "用法：/roblox游戏ID搜索 数字ID\n"
             "可选参数：--文本 | --图片 | --背景=自定义CSS背景\n"
-            "示例：/roblox游戏搜索 doors\n"
-            "示例：/roblox游戏搜索 --文本 6516141723\n"
-            "示例：/roblox游戏搜索 --背景=linear-gradient(135deg,#0f172a,#1d4ed8) Blox Fruits"
+            "示例：/roblox游戏ID搜索 6516141723\n"
+            "示例：/roblox游戏ID搜索 --文本 2440500124"
         )
 
-    async def _resolve_game(self, query: str) -> RobloxGame | None:
-        query = query.strip()
-        if not query:
-            return None
-
-        if query.isdigit():
-            by_id = await self._resolve_game_by_id(int(query))
-            if by_id:
-                return by_id
-
-        search_hit = await self._search_game(query)
+    async def _resolve_game_by_name(self, query: str) -> RobloxGame | None:
+        search_hit = await self._search_game(query.strip())
         if not search_hit:
             return None
 
         universe_id = int(search_hit["universe_id"])
-        detail_task = self._fetch_game_detail(universe_id)
-        votes_task = self._fetch_votes(universe_id)
-        image_task = self._fetch_image(universe_id)
-        detail, votes, image_url = await asyncio.gather(detail_task, votes_task, image_task)
+        detail = await self._fetch_game_detail(universe_id)
         if not detail:
             return None
-        return await self._build_game(
-            detail,
-            votes,
-            image_url,
-            search_hit["description"],
-            search_hit,
-        )
+
+        votes = await self._fetch_votes(universe_id)
+        image_url = await self._fetch_image(universe_id)
+        return await self._build_game(detail, votes, image_url, search_hit["description"], search_hit)
 
     async def _resolve_game_by_id(self, numeric_id: int) -> RobloxGame | None:
         detail = await self._fetch_game_detail(numeric_id)
         if detail:
-            votes_task = self._fetch_votes(numeric_id)
-            image_task = self._fetch_image(numeric_id)
-            age_task = self._fetch_age_info(
-                int(detail.get("id", numeric_id)),
-                normalize_text(detail.get("name"), ""),
-            )
-            votes, image_url, age_info = await asyncio.gather(votes_task, image_task, age_task)
+            universe_id = int(detail.get("id", numeric_id))
+            votes = await self._fetch_votes(universe_id)
+            image_url = await self._fetch_image(universe_id)
+            age_info = await self._fetch_age_info(universe_id, normalize_text(detail.get("name"), ""))
             return await self._build_game(detail, votes, image_url, "", age_info)
 
         universe_id = await self._place_to_universe(numeric_id)
         if not universe_id:
             return None
 
-        detail_task = self._fetch_game_detail(universe_id)
-        votes_task = self._fetch_votes(universe_id)
-        image_task = self._fetch_image(universe_id)
-        detail, votes, image_url = await asyncio.gather(detail_task, votes_task, image_task)
+        detail = await self._fetch_game_detail(universe_id)
         if not detail:
             return None
-        age_info = await self._fetch_age_info(
-            universe_id,
-            normalize_text(detail.get("name"), ""),
-        )
+
+        votes = await self._fetch_votes(universe_id)
+        image_url = await self._fetch_image(universe_id)
+        age_info = await self._fetch_age_info(universe_id, normalize_text(detail.get("name"), ""))
         return await self._build_game(detail, votes, image_url, "", age_info)
 
     async def _search_game(self, query: str) -> dict[str, Any] | None:
@@ -571,28 +584,6 @@ class RobloxGameSearchPlugin(Star):
         search_hit = await self._search_game(name)
         if search_hit and int(search_hit.get("universe_id", 0)) == universe_id:
             return search_hit
-
-        params = {
-            "searchQuery": name,
-            "pageToken": "",
-            "sessionId": str(uuid.uuid4()),
-            "pageType": "all",
-        }
-        payload = await self._get_json(OMNI_SEARCH_URL, params=params)
-        for block in payload.get("searchResults", []):
-            if block.get("contentGroupType") != "Game":
-                continue
-            for content in block.get("contents", []):
-                if int(content.get("universeId", 0) or 0) != universe_id:
-                    continue
-                return {
-                    "age_recommendation": normalize_text(
-                        content.get("ageRecommendationDisplayName"),
-                        "",
-                    ),
-                    "content_maturity": normalize_text(content.get("contentMaturity"), ""),
-                    "minimum_age": int(content.get("minimumAge", 0) or 0),
-                }
         return {}
 
     async def _fetch_game_detail(self, universe_id: int) -> dict[str, Any] | None:
@@ -628,8 +619,8 @@ class RobloxGameSearchPlugin(Star):
         return int(universe_id) if universe_id else None
 
     async def _fetch_servers(self, root_place_id: int) -> tuple[list[RobloxServer], bool, bool]:
-        page_size = min(100, max(10, int(self.config.get("server_page_size", 100))))
-        page_limit = max(1, int(self.config.get("server_scan_page_limit", 30)))
+        page_size = min(100, max(10, int(self.config.get("server_page_size", 30))))
+        page_limit = max(1, int(self.config.get("server_scan_page_limit", 5)))
         cursor = None
         all_servers: list[RobloxServer] = []
         scanned_all = True
@@ -639,7 +630,13 @@ class RobloxGameSearchPlugin(Star):
             params = {"sortOrder": "Asc", "limit": str(page_size)}
             if cursor:
                 params["cursor"] = cursor
-            payload = await self._get_json(PUBLIC_SERVERS_URL.format(place_id=root_place_id), params=params)
+            try:
+                payload = await self._get_json(PUBLIC_SERVERS_URL.format(place_id=root_place_id), params=params)
+            except RobloxRateLimitError:
+                scanned_all = False
+                page_limit_hit = True
+                break
+
             for item in payload.get("data", []):
                 playing = int(item.get("playing", 0))
                 max_players = int(item.get("maxPlayers", 0))
@@ -732,18 +729,42 @@ class RobloxGameSearchPlugin(Star):
         shown = len(display_servers)
         total = len(game.servers)
         if game.scanned_all_servers:
-            return f"已展示 {shown} 个公开服务器，已完成全量统计，共 {total} 个服务器。"
+            return f"已展示 {shown} 个公开服务器，已完成当前扫描，共统计到 {total} 个服务器。"
         if game.page_limit_hit:
             return (
                 f"已展示 {shown} 个公开服务器，当前仅统计到 {total} 个服务器。"
-                "由于公开服务器过多，已触发扫描上限，显示的是初版的截断结果。"
+                "为了避免请求过快触发 Roblox 限流，服务器扫描已提前停止。"
             )
         return f"已展示 {shown} 个公开服务器，当前已统计至少 {total} 个服务器。"
 
     async def _get_json(self, url: str, params: dict[str, str] | None = None) -> dict[str, Any]:
-        response = await self.client.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, dict) and data.get("errors"):
-            raise RuntimeError(data["errors"][0].get("message", "Roblox API 返回错误"))
-        return data if isinstance(data, dict) else {}
+        retries = max(0, int(self.config.get("retry_429_count", 2)))
+        backoff_ms = max(500, int(self.config.get("retry_429_backoff_ms", 3000)))
+        attempt = 0
+
+        while True:
+            await self._wait_for_request_slot()
+            try:
+                response = await self.client.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                if isinstance(data, dict) and data.get("errors"):
+                    raise RuntimeError(data["errors"][0].get("message", "Roblox API 返回错误"))
+                return data if isinstance(data, dict) else {}
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429:
+                    if attempt >= retries:
+                        raise RobloxRateLimitError("Roblox API 请求过快，已触发 429。") from exc
+                    await asyncio.sleep((backoff_ms / 1000.0) * (attempt + 1))
+                    attempt += 1
+                    continue
+                raise
+
+    async def _wait_for_request_slot(self):
+        min_interval_ms = max(0, int(self.config.get("min_request_interval_ms", 500)))
+        async with self._request_lock:
+            now = time.monotonic()
+            wait_seconds = (min_interval_ms / 1000.0) - (now - self._last_request_ts)
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+            self._last_request_ts = time.monotonic()
