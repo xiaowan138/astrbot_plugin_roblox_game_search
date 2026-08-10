@@ -158,6 +158,13 @@ HTML_TEMPLATE = """
       color: rgba(248, 250, 252, 0.62);
       line-height: 1.6;
     }
+    .server-unavailable {
+      padding: 18px;
+      border-radius: 18px;
+      color: rgba(248, 250, 252, 0.72);
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
   </style>
 </head>
 <body>
@@ -213,6 +220,7 @@ HTML_TEMPLATE = """
 
     <div class="section">
       <h2 class="section-title">公开服务器状态</h2>
+      {% if game.server_data_available %}
       <table>
         <thead>
           <tr>
@@ -235,6 +243,9 @@ HTML_TEMPLATE = """
           {% endfor %}
         </tbody>
       </table>
+      {% else %}
+      <div class="server-unavailable">公开服务器数据暂不可用。</div>
+      {% endif %}
     </div>
 
     <div class="footer-note">
@@ -287,6 +298,7 @@ class RobloxGame:
     servers: list[RobloxServer]
     scanned_all_servers: bool
     page_limit_hit: bool
+    server_data_available: bool
 
     @property
     def rating(self) -> float:
@@ -367,7 +379,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.1.7",
+    "0.1.8",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -376,7 +388,7 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.7"},
+            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.8"},
             follow_redirects=True,
         )
         self._request_lock = asyncio.Lock()
@@ -477,6 +489,7 @@ class RobloxGameSearchPlugin(Star):
                         "server_players_text": game.server_players_text,
                         "root_place_id": game.root_place_id,
                         "server_note": self._server_note(game, display_servers),
+                        "server_data_available": game.server_data_available,
                         "display_servers": [
                             {
                                 "status": server.status,
@@ -553,10 +566,7 @@ class RobloxGameSearchPlugin(Star):
                 mode = value
                 text = re.sub(pattern, " ", text, flags=re.IGNORECASE).strip()
 
-        bg_match = re.search(r"--?(?:背景|bg)=(.+?)(?=\s--|$)", text, re.IGNORECASE)
-        if bg_match:
-            background = bg_match.group(1).strip()
-            text = text.replace(bg_match.group(0), " ").strip()
+        background, text = self._extract_background_option(text)
 
         server_match = re.search(r"--?(?:服务器数|servers?)=(\d+)", text, re.IGNORECASE)
         if server_match:
@@ -569,21 +579,82 @@ class RobloxGameSearchPlugin(Star):
             "servers": server_match.group(1) if server_match else None,
         }
 
+    def _extract_background_option(self, text: str) -> tuple[str | None, str]:
+        """Extract a CSS background option without consuming the game name."""
+        option_match = re.search(r"(?:^|\s)--?(?:背景|bg)=", text, re.IGNORECASE)
+        if not option_match:
+            return None, text
+
+        value_start = option_match.end()
+        remainder = text[value_start:].lstrip()
+        option_end = value_start + (len(text[value_start:]) - len(remainder))
+        if not remainder:
+            return None, text
+
+        if remainder[0] in {"\"", "'"}:
+            quote = remainder[0]
+            closing_quote = remainder.find(quote, 1)
+            if closing_quote == -1:
+                return None, text
+            background = remainder[1:closing_quote].strip()
+            option_end += closing_quote + 1
+        else:
+            function_match = re.match(r"[A-Za-z-]+\(", remainder)
+            if function_match:
+                depth = 0
+                quote: str | None = None
+                escaped = False
+                option_length = 0
+                for index, char in enumerate(remainder):
+                    if quote:
+                        if escaped:
+                            escaped = False
+                        elif char == "\\":
+                            escaped = True
+                        elif char == quote:
+                            quote = None
+                        continue
+                    if char in {"\"", "'"}:
+                        quote = char
+                    elif char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                        if depth == 0:
+                            option_length = index + 1
+                            break
+                if not option_length:
+                    return None, text
+                background = remainder[:option_length].strip()
+                option_end += option_length
+            else:
+                value_match = re.match(r"\S+", remainder)
+                if not value_match:
+                    return None, text
+                background = value_match.group(0).strip()
+                option_end += len(value_match.group(0))
+
+        query = f"{text[:option_match.start()]} {text[option_end:]}".strip()
+        return background or None, query
+
     def _usage_text(self, search_mode: str) -> str:
         if search_mode == "name":
             return (
                 "用法：/roblox游戏搜索 游戏名\n"
                 "别名：/游戏搜索 游戏名\n"
-                "可选参数：--文本 | --图片 | --背景=自定义CSS背景\n"
+                "可选参数：--文本 | --图片 | --服务器数=N | --背景=自定义CSS背景\n"
                 "示例：/roblox游戏搜索 doors\n"
-                "示例：/游戏搜索 --文本 Blox Fruits"
+                "示例：/游戏搜索 --文本 Blox Fruits\n"
+                "示例：/游戏搜索 --背景=linear-gradient(135deg,#0f172a,#1d4ed8) Doors\n"
+                "复杂背景请使用引号：--背景=\"radial-gradient(...), linear-gradient(...)\" Doors"
             )
         return (
             "用法：/roblox游戏ID搜索 数字ID\n"
             "别名：/游戏ID搜索 数字ID\n"
-            "可选参数：--文本 | --图片 | --背景=自定义CSS背景\n"
+            "可选参数：--文本 | --图片 | --服务器数=N | --背景=自定义CSS背景\n"
             "示例：/roblox游戏ID搜索 6516141723\n"
-            "示例：/游戏ID搜索 --文本 2440500124"
+            "示例：/游戏ID搜索 --文本 2440500124\n"
+            "示例：/游戏ID搜索 --服务器数=5 2440500124"
         )
 
     async def _resolve_game_by_name(self, query: str) -> RobloxGame | None:
@@ -1060,13 +1131,17 @@ class RobloxGameSearchPlugin(Star):
         universe_id = payload.get("universeId")
         return int(universe_id) if universe_id else None
 
-    async def _fetch_servers(self, root_place_id: int) -> tuple[list[RobloxServer], bool, bool]:
+    async def _fetch_servers(self, root_place_id: int) -> tuple[list[RobloxServer], bool, bool, bool]:
+        if root_place_id <= 0:
+            return [], False, False, False
+
         page_size = min(100, max(10, int(self.config.get("server_page_size", 30))))
         page_limit = max(1, int(self.config.get("server_scan_page_limit", 5)))
         cursor = None
         all_servers: list[RobloxServer] = []
         scanned_all = True
         page_limit_hit = False
+        server_data_available = True
 
         for _ in range(page_limit):
             params = {"sortOrder": "Asc", "limit": str(page_size)}
@@ -1077,6 +1152,11 @@ class RobloxGameSearchPlugin(Star):
             except RobloxRateLimitError:
                 scanned_all = False
                 page_limit_hit = True
+                break
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                logger.warning("获取 Roblox 公开服务器失败（place_id=%s）: %s", root_place_id, exc)
+                scanned_all = False
+                server_data_available = bool(all_servers)
                 break
 
             for item in payload.get("data", []):
@@ -1104,7 +1184,7 @@ class RobloxGameSearchPlugin(Star):
 
         if cursor:
             scanned_all = False
-        return all_servers, scanned_all, page_limit_hit
+        return all_servers, scanned_all, page_limit_hit, server_data_available
 
     async def _build_game(
         self,
@@ -1115,7 +1195,7 @@ class RobloxGameSearchPlugin(Star):
         age_info: dict[str, Any] | None,
     ) -> RobloxGame:
         root_place_id = int(detail.get("rootPlaceId", 0))
-        servers, scanned_all, page_limit_hit = await self._fetch_servers(root_place_id)
+        servers, scanned_all, page_limit_hit, server_data_available = await self._fetch_servers(root_place_id)
 
         genre_l1 = normalize_text(detail.get("genre_l1"), "")
         genre_l2 = normalize_text(detail.get("genre_l2"), "")
@@ -1145,6 +1225,7 @@ class RobloxGameSearchPlugin(Star):
             servers=servers,
             scanned_all_servers=scanned_all,
             page_limit_hit=page_limit_hit,
+            server_data_available=server_data_available,
         )
 
     def _render_text(self, game: RobloxGame, display_servers: list[RobloxServer]) -> str:
@@ -1170,6 +1251,8 @@ class RobloxGameSearchPlugin(Star):
     def _server_note(self, game: RobloxGame, display_servers: list[RobloxServer]) -> str:
         shown = len(display_servers)
         total = len(game.servers)
+        if not game.server_data_available:
+            return "公开服务器数据暂不可用，已正常返回游戏基本信息。"
         if game.scanned_all_servers:
             return f"已展示 {shown} 个公开服务器，已完成当前扫描，共统计到 {total} 个服务器。"
         if game.page_limit_hit:
