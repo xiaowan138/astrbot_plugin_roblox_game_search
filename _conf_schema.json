@@ -23,8 +23,8 @@
   "server_page_size": {
     "description": "每次拉取服务器的分页大小",
     "type": "int",
-    "default": 30,
-    "hint": "数值越小越不容易触发限流，但统计会更慢。建议 20 到 50。"
+    "default": 50,
+    "hint": "Roblox 公开服务器接口只接受 10 / 25 / 50 / 100，其他值会自动收敛到最接近的合法值。数值越小越不容易触发限流，但统计会更慢。"
   },
   "server_scan_page_limit": {
     "description": "服务器扫描页数上限",
@@ -54,7 +54,7 @@
     "description": "游戏名搜索最低匹配分",
     "type": "int",
     "default": 2200,
-    "hint": "候选游戏名低于该匹配分时不返回结果，避免 Roblox 搜索给出不相关游戏。调低会更宽松，调高会更严格。"
+    "hint": "候选游戏名低于该匹配分时不返回结果，避免 Roblox 搜索给出不相关游戏。调低会更宽松，调高会更严格。默认值下，拼写相近（相似度约 0.74 以上）的游戏也能命中。"
   },
   "game_aliases": {
     "description": "游戏名别名映射",
@@ -80,5 +80,23 @@
     "type": "int",
     "default": 20,
     "hint": "Roblox API 波动较大时可以适当调高。"
+  },
+  "enable_cache": {
+    "description": "启用内存缓存",
+    "type": "bool",
+    "default": true,
+    "hint": "缓存游戏详情、投票、图片、年龄组和服务器数据，重复查询更快且更省 Roblox 接口额度。"
+  },
+  "cache_static_ttl_seconds": {
+    "description": "静态数据缓存时长（秒）",
+    "type": "int",
+    "default": 3600,
+    "hint": "游戏名/简介/开发者/投票/图片/年龄组等不常变化的数据的缓存时长。设为 0 表示立即过期。"
+  },
+  "cache_servers_ttl_seconds": {
+    "description": "服务器数据缓存时长（秒）",
+    "type": "int",
+    "default": 180,
+    "hint": "在线服务器数据变化较快，缓存时间短一些，默认 3 分钟。设为 0 表示立即过期。"
   }
 }

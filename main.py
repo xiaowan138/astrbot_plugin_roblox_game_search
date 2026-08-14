@@ -23,6 +23,14 @@ PLACE_TO_UNIVERSE_URL = "https://apis.roblox.com/universes/v1/places/{place_id}/
 PUBLIC_SERVERS_URL = "https://games.roblox.com/v1/games/{place_id}/servers/Public"
 TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
+GAME_URL_ID_PATTERN = re.compile(r"roblox\.com/games/(\d+)", re.IGNORECASE)
+
+# Roblox 公开服务器接口只接受这几个分页大小
+VALID_SERVER_PAGE_SIZES = (10, 25, 50, 100)
+
+# 缓存哨兵：用于区分“未缓存”和“缓存了 None / 空结果”
+_NOT_CACHED = object()
+
 DEFAULT_BACKGROUND = (
     "radial-gradient(circle at top left, rgba(99, 102, 241, 0.35), transparent 28%), "
     "radial-gradient(circle at top right, rgba(16, 185, 129, 0.28), transparent 24%), "
@@ -85,6 +93,10 @@ HTML_TEMPLATE = """
       color: rgba(248, 250, 252, 0.88);
       margin: 0;
       white-space: pre-wrap;
+      display: -webkit-box;
+      -webkit-line-clamp: 4;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
     }
     .badges {
       display: flex;
@@ -171,50 +183,58 @@ HTML_TEMPLATE = """
   <div class="panel">
     <div class="hero">
       <div class="cover">
-        <img src="{{ game.image_url }}" alt="game-icon" />
+        <img src="{{ game.image_url | e }}" alt="game-icon" />
       </div>
       <div>
-        <h1 class="title">{{ game.name }}</h1>
+        <h1 class="title">{{ game.name | e }}</h1>
         <div class="badges">
-          <span class="badge">开发者：{{ game.creator_name }}</span>
-          <span class="badge">类型：{{ game.genre }}</span>
-          <span class="badge">年龄组：{{ game.age_text }}</span>
-          <span class="badge">好评率：{{ game.rating_text }}</span>
-          <span class="badge">在线：{{ game.playing_text }}</span>
-          <span class="badge">公开服：{{ game.server_count_text }}</span>
+          <span class="badge">开发者：{{ game.creator_name | e }}</span>
+          <span class="badge">类型：{{ game.genre | e }}</span>
+          <span class="badge">年龄组：{{ game.age_text | e }}</span>
+          <span class="badge">好评率：{{ game.rating_text | e }}</span>
+          <span class="badge">在线：{{ game.playing_text | e }}</span>
+          <span class="badge">公开服：{{ game.server_count_text | e }}</span>
         </div>
-        <p class="desc">{{ game.description }}</p>
+        <p class="desc">{{ game.description | e }}</p>
       </div>
     </div>
 
     <div class="stats">
       <div class="stat">
         <div class="stat-label">开发者</div>
-        <div class="stat-value">{{ game.creator_name }}</div>
+        <div class="stat-value">{{ game.creator_name | e }}</div>
       </div>
       <div class="stat">
         <div class="stat-label">游戏类型</div>
-        <div class="stat-value">{{ game.genre }}</div>
+        <div class="stat-value">{{ game.genre | e }}</div>
       </div>
       <div class="stat">
         <div class="stat-label">年龄组</div>
-        <div class="stat-value">{{ game.age_text }}</div>
+        <div class="stat-value">{{ game.age_text | e }}</div>
       </div>
       <div class="stat">
         <div class="stat-label">好评度</div>
-        <div class="stat-value">{{ game.rating_text }}</div>
+        <div class="stat-value">{{ game.rating_text | e }}</div>
       </div>
       <div class="stat">
         <div class="stat-label">当前在线人数</div>
-        <div class="stat-value">{{ game.playing_text }}</div>
+        <div class="stat-value">{{ game.playing_text | e }}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">总访问量</div>
+        <div class="stat-value">{{ game.visits_text | e }}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">收藏数</div>
+        <div class="stat-value">{{ game.favorited_text | e }}</div>
       </div>
       <div class="stat">
         <div class="stat-label">公开服务器统计</div>
-        <div class="stat-value">{{ game.server_count_text }}</div>
+        <div class="stat-value">{{ game.server_count_text | e }}</div>
       </div>
       <div class="stat">
         <div class="stat-label">公开服在线总人数</div>
-        <div class="stat-value">{{ game.server_players_text }}</div>
+        <div class="stat-value">{{ game.server_players_text | e }}</div>
       </div>
     </div>
 
@@ -235,22 +255,22 @@ HTML_TEMPLATE = """
           {% for server in game.display_servers %}
           <tr>
             <td>{{ loop.index }}</td>
-            <td>{{ server.status }}</td>
-            <td>{{ server.playing }}/{{ server.max_players }}</td>
-            <td>{{ server.ping_text }}</td>
-            <td>{{ server.fps_text }}</td>
+            <td>{{ server.status | e }}</td>
+            <td>{{ server.playing | e }}/{{ server.max_players | e }}</td>
+            <td>{{ server.ping_text | e }}</td>
+            <td>{{ server.fps_text | e }}</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
       {% else %}
-      <div class="server-unavailable">公开服务器数据暂不可用。</div>
+      <div class="server-unavailable">{{ game.server_note | e }}</div>
       {% endif %}
     </div>
 
     <div class="footer-note">
-      {{ game.server_note }}<br />
-      Roblox 链接：https://www.roblox.com/games/{{ game.root_place_id }}
+      {% if game.server_data_available %}{{ game.server_note | e }}<br />{% endif %}
+      Roblox 链接：https://www.roblox.com/games/{{ game.root_place_id | e }}
     </div>
   </div>
 </body>
@@ -260,6 +280,46 @@ HTML_TEMPLATE = """
 
 class RobloxRateLimitError(RuntimeError):
     pass
+
+
+@dataclass
+class _CacheEntry:
+    value: Any
+    expires_at: float
+
+
+class TTLCache:
+    """进程内简单的 TTL 缓存：到期惰性清理，带容量上限，避免无限增长。"""
+
+    def __init__(self, default_ttl: float, max_entries: int = 256):
+        self._default_ttl = default_ttl
+        self._max_entries = max_entries
+        self._data: dict[Any, _CacheEntry] = {}
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        entry = self._data.get(key)
+        if entry is None:
+            return default
+        if entry.expires_at <= time.monotonic():
+            del self._data[key]
+            return default
+        return entry.value
+
+    def set(self, key: Any, value: Any, ttl: float | None = None) -> None:
+        ttl_seconds = self._default_ttl if ttl is None else ttl
+        if ttl_seconds <= 0:
+            return  # TTL 为 0 表示禁用缓存
+        if len(self._data) >= self._max_entries and key not in self._data:
+            self._evict()
+        self._data[key] = _CacheEntry(value, time.monotonic() + ttl_seconds)
+
+    def _evict(self) -> None:
+        now = time.monotonic()
+        for key in [k for k, entry in self._data.items() if entry.expires_at <= now]:
+            del self._data[key]
+        if len(self._data) >= self._max_entries:
+            oldest_key = min(self._data, key=lambda k: self._data[k].expires_at)
+            del self._data[oldest_key]
 
 
 @dataclass
@@ -292,6 +352,8 @@ class RobloxGame:
     content_maturity: str
     minimum_age: int
     playing: int
+    visits: int
+    favorited: int
     up_votes: int
     down_votes: int
     image_url: str
@@ -299,6 +361,7 @@ class RobloxGame:
     scanned_all_servers: bool
     page_limit_hit: bool
     server_data_available: bool
+    servers_skipped: bool = False
 
     @property
     def rating(self) -> float:
@@ -312,6 +375,14 @@ class RobloxGame:
     @property
     def playing_text(self) -> str:
         return format_number(self.playing)
+
+    @property
+    def visits_text(self) -> str:
+        return format_number(self.visits)
+
+    @property
+    def favorited_text(self) -> str:
+        return format_number(self.favorited)
 
     @property
     def age_text(self) -> str:
@@ -379,7 +450,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.1.8",
+    "0.2.0",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -388,12 +459,25 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "AstrBot-Roblox-Search/0.1.8"},
+            headers={"User-Agent": "AstrBot-Roblox-Search/0.2.0"},
             follow_redirects=True,
         )
         self._request_lock = asyncio.Lock()
         self._last_request_ts = 0.0
-        self._recent_event_keys: dict[str, float] = {}
+
+        cache_enabled = bool(self.config.get("enable_cache", True))
+        static_ttl = max(0, int(self.config.get("cache_static_ttl_seconds", 3600)))
+        servers_ttl = max(0, int(self.config.get("cache_servers_ttl_seconds", 180)))
+        if not cache_enabled:
+            static_ttl = 0
+            servers_ttl = 0
+        self._cache_search = TTLCache(static_ttl)
+        self._cache_detail = TTLCache(static_ttl)
+        self._cache_votes = TTLCache(static_ttl)
+        self._cache_image = TTLCache(static_ttl)
+        self._cache_age = TTLCache(static_ttl)
+        self._cache_servers = TTLCache(servers_ttl)
+        self._cache_place_universe = TTLCache(static_ttl)
 
     async def terminate(self):
         await self.client.aclose()
@@ -429,39 +513,42 @@ class RobloxGameSearchPlugin(Star):
             else ["roblox游戏ID搜索", "游戏ID搜索"]
         )
         args = self._parse_command_args(query_text, command_names)
+        query = args["query"]
 
-        if not args["query"]:
+        if not query:
             yield event.plain_result(self._usage_text(search_mode))
             return
 
-        if search_mode == "name" and args["query"].isdigit():
+        # 支持直接粘贴 Roblox 游戏链接：自动提取数字 ID 并按 ID 搜索
+        url_id = self._extract_game_url_id(query)
+        if url_id is not None:
+            query = url_id
+            search_mode = "id"
+
+        if search_mode == "name" and query.isdigit():
             yield event.plain_result("这个指令用于按游戏名搜索。纯数字 ID 请使用 /roblox游戏ID搜索。")
             return
 
-        if search_mode == "id" and not args["query"].isdigit():
+        if search_mode == "id" and not query.isdigit():
             yield event.plain_result("这个指令只接受纯数字 ID。游戏名请使用 /roblox游戏搜索。")
             return
 
         render_mode = args["mode"] or str(self.config.get("default_render_mode", "html")).lower()
         background = args["background"] or str(self.config.get("html_background", DEFAULT_BACKGROUND))
+        fetch_servers = not args["compact"]
 
         try:
             if search_mode == "name":
-                game = await self._resolve_game_by_name(args["query"])
+                game, suggestions = await self._resolve_game_by_name(query, fetch_servers=fetch_servers)
             else:
-                game = await self._resolve_game_by_id(int(args["query"]))
+                game = await self._resolve_game_by_id(int(query), fetch_servers=fetch_servers)
+                suggestions = []
 
             if not game:
-                yield event.plain_result(self._not_found_text(args["query"]))
+                yield event.plain_result(self._not_found_text(query, suggestions))
                 return
 
-            display_limit = max(1, int(self.config.get("server_display_limit", 10)))
-            if args["servers"]:
-                display_limit = max(1, int(args["servers"]))
-            display_servers = sorted(
-                game.servers,
-                key=lambda server: (server.ping is None, server.ping if server.ping is not None else math.inf),
-            )[:display_limit]
+            display_servers = self._display_servers(game, args["servers"], args["sort"])
 
             if render_mode == "text":
                 yield event.chain_result(
@@ -472,39 +559,50 @@ class RobloxGameSearchPlugin(Star):
                 )
                 return
 
-            image_url = await self.html_render(
-                HTML_TEMPLATE,
-                {
-                    "background": background,
-                    "game": {
-                        "name": game.name,
-                        "image_url": game.image_url,
-                        "description": game.description,
-                        "creator_name": game.creator_name,
-                        "genre": game.genre,
-                        "age_text": game.age_text,
-                        "rating_text": game.rating_text,
-                        "playing_text": game.playing_text,
-                        "server_count_text": game.server_count_text,
-                        "server_players_text": game.server_players_text,
-                        "root_place_id": game.root_place_id,
-                        "server_note": self._server_note(game, display_servers),
-                        "server_data_available": game.server_data_available,
-                        "display_servers": [
-                            {
-                                "status": server.status,
-                                "playing": server.playing,
-                                "max_players": server.max_players,
-                                "ping_text": server.ping_text,
-                                "fps_text": server.fps_text,
-                            }
-                            for server in display_servers
-                        ],
+            try:
+                image_url = await self.html_render(
+                    HTML_TEMPLATE,
+                    {
+                        "background": background,
+                        "game": {
+                            "name": game.name,
+                            "image_url": game.image_url,
+                            "description": game.description,
+                            "creator_name": game.creator_name,
+                            "genre": game.genre,
+                            "age_text": game.age_text,
+                            "rating_text": game.rating_text,
+                            "playing_text": game.playing_text,
+                            "visits_text": game.visits_text,
+                            "favorited_text": game.favorited_text,
+                            "server_count_text": game.server_count_text,
+                            "server_players_text": game.server_players_text,
+                            "root_place_id": game.root_place_id,
+                            "server_note": self._server_note(game, display_servers),
+                            "server_data_available": game.server_data_available,
+                            "display_servers": [
+                                {
+                                    "status": server.status,
+                                    "playing": server.playing,
+                                    "max_players": server.max_players,
+                                    "ping_text": server.ping_text,
+                                    "fps_text": server.fps_text,
+                                }
+                                for server in display_servers
+                            ],
+                        },
                     },
-                },
-                options={"type": "png", "full_page": True, "animations": "disabled"},
-            )
-            yield event.image_result(image_url)
+                    options={"type": "png", "full_page": True, "animations": "disabled"},
+                )
+                yield event.image_result(image_url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("HTML 渲染失败，已自动降级为文本模式: %s", exc)
+                yield event.chain_result(
+                    [
+                        Comp.Image.fromURL(game.image_url),
+                        Comp.Plain(self._render_text(game, display_servers)),
+                    ]
+                )
         except RobloxRateLimitError:
             yield event.plain_result("Roblox 接口限流了，插件已放慢请求节奏。请稍等几十秒后再试。")
         except Exception as exc:  # noqa: BLE001
@@ -517,39 +615,29 @@ class RobloxGameSearchPlugin(Star):
         if event.get_extra(event_extra_key):
             return True
         event.set_extra(event_extra_key, True)
-
-        now = time.monotonic()
-        ttl_seconds = 5.0
-        cutoff = now - ttl_seconds
-        if len(self._recent_event_keys) > 120:
-            self._recent_event_keys = {
-                key: ts for key, ts in self._recent_event_keys.items() if ts >= cutoff
-            }
-
-        message_obj = getattr(event, "message_obj", None)
-        message_id = getattr(message_obj, "message_id", "") or getattr(message_obj, "id", "")
-        sender_id = (
-            getattr(message_obj, "sender_id", "")
-            or getattr(message_obj, "sender", "")
-            or getattr(message_obj, "user_id", "")
-        )
-        origin = getattr(event, "unified_msg_origin", "") or getattr(event, "session_id", "")
-        dedupe_key = f"{search_mode}:{origin}:{sender_id}:{message_id}:{raw_message}"
-        last_seen = self._recent_event_keys.get(dedupe_key)
-        if last_seen and last_seen >= cutoff:
-            return True
-        self._recent_event_keys[dedupe_key] = now
         return False
 
-    def _not_found_text(self, query: str) -> str:
+    def _extract_game_url_id(self, text: str) -> str | None:
+        match = GAME_URL_ID_PATTERN.search(text or "")
+        return match.group(1) if match else None
+
+    def _not_found_text(self, query: str, suggestions: list[dict[str, Any]] | None = None) -> str:
         if re.search(r"[\u4e00-\u9fff]", query or ""):
-            return (
+            text = (
                 "没有找到对应的 Roblox 游戏。插件已经尝试中文别名、关键词翻译和英文候选搜索，"
                 "可以换一个更完整的游戏名再试。"
             )
-        return "没有找到对应的 Roblox 游戏，请检查输入后再试。"
+        else:
+            text = "没有找到对应的 Roblox 游戏，请检查输入后再试。"
+        if suggestions:
+            lines = ["", "相近候选（发送 /roblox游戏ID搜索 <ID> 查看）："]
+            for index, candidate in enumerate(suggestions[:3], start=1):
+                name = normalize_text(candidate.get("name"), "未知游戏")
+                lines.append(f"{index}. {name}（ID: {candidate.get('root_place_id')}）")
+            text += "\n".join(lines)
+        return text
 
-    def _parse_command_args(self, message: str, command_names: list[str]) -> dict[str, str | None]:
+    def _parse_command_args(self, message: str, command_names: list[str]) -> dict[str, Any]:
         text = re.sub(r"^/+", "", (message or "").strip())
         commands_pattern = "|".join(re.escape(command_name) for command_name in command_names)
         text = re.sub(rf"^(?:{commands_pattern})", "", text, count=1).strip()
@@ -557,6 +645,8 @@ class RobloxGameSearchPlugin(Star):
         mode = None
         background = None
         server_match = None
+        compact = False
+        sort_mode = "ping"
 
         for pattern, value in (
             (r"(?:^|\s)--?(?:文本|text)(?:\s|$)", "text"),
@@ -565,6 +655,30 @@ class RobloxGameSearchPlugin(Star):
             if re.search(pattern, text, re.IGNORECASE):
                 mode = value
                 text = re.sub(pattern, " ", text, flags=re.IGNORECASE).strip()
+
+        compact_pattern = r"(?:^|\s)--?(?:简洁|compact|noservers?)(?:\s|$)"
+        if re.search(compact_pattern, text, re.IGNORECASE):
+            compact = True
+            text = re.sub(compact_pattern, " ", text, flags=re.IGNORECASE).strip()
+
+        # 只匹配已知的排序方式，避免误吞游戏名
+        sort_match = re.search(
+            r"--?(?:排序|sort)=(人数|players|空位|free|延迟|ping)",
+            text,
+            re.IGNORECASE,
+        )
+        if sort_match:
+            sort_key = sort_match.group(1).lower()
+            if sort_key in {"players", "人数"}:
+                sort_mode = "players"
+            elif sort_key in {"free", "空位"}:
+                sort_mode = "free"
+            else:
+                sort_mode = "ping"
+            text = text.replace(sort_match.group(0), " ").strip()
+        else:
+            # 未知的 --排序=xxx 也剥掉，避免污染游戏名
+            text = re.sub(r"--?(?:排序|sort)=\S+", " ", text, flags=re.IGNORECASE).strip()
 
         background, text = self._extract_background_option(text)
 
@@ -577,6 +691,8 @@ class RobloxGameSearchPlugin(Star):
             "mode": mode,
             "background": background,
             "servers": server_match.group(1) if server_match else None,
+            "compact": compact,
+            "sort": sort_mode,
         }
 
     def _extract_background_option(self, text: str) -> tuple[str | None, str]:
@@ -638,63 +754,115 @@ class RobloxGameSearchPlugin(Star):
         return background or None, query
 
     def _usage_text(self, search_mode: str) -> str:
+        common = (
+            "可选参数：--文本 | --图片 | --简洁（跳过服务器扫描）| --排序=延迟|人数|空位 "
+            "| --服务器数=N | --背景=自定义CSS背景\n"
+        )
         if search_mode == "name":
             return (
                 "用法：/roblox游戏搜索 游戏名\n"
                 "别名：/游戏搜索 游戏名\n"
-                "可选参数：--文本 | --图片 | --服务器数=N | --背景=自定义CSS背景\n"
-                "示例：/roblox游戏搜索 doors\n"
+                "支持粘贴 Roblox 游戏链接：/roblox游戏搜索 https://www.roblox.com/games/2440500124/Blox-Fruits\n"
+                + common
+                + "示例：/roblox游戏搜索 doors\n"
                 "示例：/游戏搜索 --文本 Blox Fruits\n"
+                "示例：/游戏搜索 --简洁 doors\n"
+                "示例：/游戏搜索 --排序=人数 --服务器数=5 doors\n"
                 "示例：/游戏搜索 --背景=linear-gradient(135deg,#0f172a,#1d4ed8) Doors\n"
                 "复杂背景请使用引号：--背景=\"radial-gradient(...), linear-gradient(...)\" Doors"
             )
         return (
             "用法：/roblox游戏ID搜索 数字ID\n"
             "别名：/游戏ID搜索 数字ID\n"
-            "可选参数：--文本 | --图片 | --服务器数=N | --背景=自定义CSS背景\n"
-            "示例：/roblox游戏ID搜索 6516141723\n"
+            "支持粘贴 Roblox 游戏链接：/游戏ID搜索 https://www.roblox.com/games/2440500124/Blox-Fruits\n"
+            + common
+            + "示例：/roblox游戏ID搜索 6516141723\n"
             "示例：/游戏ID搜索 --文本 2440500124\n"
             "示例：/游戏ID搜索 --服务器数=5 2440500124"
         )
 
-    async def _resolve_game_by_name(self, query: str) -> RobloxGame | None:
-        search_hit = await self._search_game(query.strip())
+    async def _resolve_game_by_name(
+        self,
+        query: str,
+        fetch_servers: bool = True,
+    ) -> tuple[RobloxGame | None, list[dict[str, Any]]]:
+        search_hit, suggestions = await self._search_game(query.strip())
         if not search_hit:
-            return None
+            return None, suggestions
 
         universe_id = int(search_hit["universe_id"])
         detail = await self._fetch_game_detail(universe_id)
         if not detail:
-            return None
+            return None, suggestions
 
         votes = await self._fetch_votes(universe_id)
         image_url = await self._fetch_image(universe_id)
-        return await self._build_game(detail, votes, image_url, search_hit["description"], search_hit)
+        game = await self._build_game(
+            detail,
+            votes,
+            image_url,
+            search_hit["description"],
+            search_hit,
+            fetch_servers=fetch_servers,
+        )
+        return game, suggestions
 
-    async def _resolve_game_by_id(self, numeric_id: int) -> RobloxGame | None:
-        detail = await self._fetch_game_detail(numeric_id)
-        if detail:
-            universe_id = int(detail.get("id", numeric_id))
-            votes = await self._fetch_votes(universe_id)
-            image_url = await self._fetch_image(universe_id)
-            age_info = await self._fetch_age_info(universe_id, normalize_text(detail.get("name"), ""))
-            return await self._build_game(detail, votes, image_url, "", age_info)
+    async def _resolve_game_by_id(self, numeric_id: int, fetch_servers: bool = True) -> RobloxGame | None:
+        # 数字 ID 可能是 universeId 也可能是 placeId（两者数字命名空间相同、可能撞号），
+        # 两个方向都解析，取更热门/更可信的那个。
+        direct_detail = await self._fetch_game_detail(numeric_id)
 
-        universe_id = await self._place_to_universe(numeric_id)
-        if not universe_id:
+        place_universe_id = await self._place_to_universe(numeric_id)
+        place_detail = None
+        if place_universe_id and place_universe_id != numeric_id:
+            place_detail = await self._fetch_game_detail(place_universe_id)
+
+        chosen_detail = self._pick_better_id_detail(direct_detail, place_detail)
+        if chosen_detail is None:
             return None
 
-        detail = await self._fetch_game_detail(universe_id)
-        if not detail:
-            return None
+        universe_id = int(chosen_detail.get("id", 0))
+        if universe_id <= 0:
+            universe_id = place_universe_id or numeric_id
 
         votes = await self._fetch_votes(universe_id)
         image_url = await self._fetch_image(universe_id)
-        age_info = await self._fetch_age_info(universe_id, normalize_text(detail.get("name"), ""))
-        return await self._build_game(detail, votes, image_url, "", age_info)
+        age_info = await self._fetch_age_info(universe_id, normalize_text(chosen_detail.get("name"), ""))
+        return await self._build_game(
+            chosen_detail,
+            votes,
+            image_url,
+            "",
+            age_info,
+            fetch_servers=fetch_servers,
+        )
 
-    async def _search_game(self, query: str) -> dict[str, Any] | None:
+    @staticmethod
+    def _pick_better_id_detail(
+        direct: dict[str, Any] | None,
+        indirect: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """ID 同时命中 universe 和 place 时，按热度（在线人数 > 访问量）选择更可信的。"""
+        if direct is None:
+            return indirect
+        if indirect is None:
+            return direct
+        direct_pop = (int(direct.get("playing", 0) or 0), int(direct.get("visits", 0) or 0))
+        indirect_pop = (int(indirect.get("playing", 0) or 0), int(indirect.get("visits", 0) or 0))
+        if direct_pop >= indirect_pop:
+            return direct
+        return indirect
+
+    async def _search_game(self, query: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         search_queries = await self._build_search_queries(query)
+        if not search_queries:
+            return None, []
+
+        cache_key = "|".join(compact_match_text(search_query) for search_query in search_queries)
+        cached = self._cache_search.get(cache_key, _NOT_CACHED)
+        if cached is not _NOT_CACHED:
+            return cached
+
         candidates: list[dict[str, Any]] = []
         seen_candidates: dict[str, dict[str, Any]] = {}
 
@@ -714,16 +882,18 @@ class RobloxGameSearchPlugin(Star):
                         int(existing.get("_best_query_index", query_index)),
                         query_index,
                     )
-                    existing.setdefault("_matched_queries", []).append(search_query)
                     continue
 
                 candidate = dict(candidate)
                 candidate["_best_query_index"] = query_index
-                candidate["_matched_queries"] = [search_query]
                 candidates.append(candidate)
                 seen_candidates[candidate_key] = candidate
 
-        return self._pick_best_search_hit(search_queries, candidates)
+        best = self._pick_best_search_hit(search_queries, candidates)
+        suggestions = self._pick_suggestions(search_queries, candidates, best)
+        result = (best, suggestions)
+        self._cache_search.set(cache_key, result)
+        return result
 
     async def _search_game_candidates(self, query: str) -> list[dict[str, Any]]:
         params = {
@@ -764,6 +934,57 @@ class RobloxGameSearchPlugin(Star):
                     index += 1
         return candidates
 
+    def _single_match_score(self, query: str, candidate: dict[str, Any]) -> float:
+        query_norm = normalize_match_text(query)
+        query_key = compact_match_text(query)
+        query_acronym = query_key
+        name = candidate.get("name", "")
+        name_norm = normalize_match_text(name)
+        name_key = compact_match_text(name)
+        name_words = name_norm.split()
+        name_acronym = "".join(word[0] for word in name_words if word)
+
+        if query_norm and name_norm == query_norm:
+            return 10000
+        if query_key and name_key == query_key:
+            return 9500
+        if query_acronym and len(query_acronym) >= 2 and name_acronym == query_acronym:
+            return 9000
+        if query_norm and name_norm.startswith(query_norm):
+            return 5200
+        if query_key and name_key.startswith(query_key):
+            return 4800
+        if query_acronym and len(query_acronym) >= 2 and name_acronym.startswith(query_acronym):
+            return 4600
+        if query_norm and f" {query_norm} " in f" {name_norm} ":
+            return 3400
+        if query_key and query_key in name_key:
+            return 2600
+        # 模糊匹配权重按相似度比例放大，默认阈值 2200 对应相似度约 0.74：
+        # 拼写相近的游戏能通过，明显无关的仍会被拒
+        return SequenceMatcher(None, query_norm, name_norm).ratio() * 3000
+
+    def _match_score(self, queries: list[str], candidate: dict[str, Any]) -> float:
+        return max(
+            (self._single_match_score(query, candidate) for query in queries),
+            default=0.0,
+        )
+
+    def _candidate_score(self, queries: list[str], candidate: dict[str, Any]) -> float:
+        base = self._match_score(queries, candidate)
+        if candidate.get("emphasis"):
+            base += 450
+        if candidate.get("is_sponsored"):
+            base -= 1600
+
+        players = max(0, int(candidate.get("player_count", 0) or 0))
+        up_votes = max(0, int(candidate.get("total_up_votes", 0) or 0))
+        base += min(math.log10(players + 1) * 130, 650)
+        base += min(math.log10(up_votes + 1) * 70, 420)
+        base -= int(candidate.get("result_index", 0)) * 2
+        base -= int(candidate.get("_best_query_index", 0)) * 20
+        return base
+
     def _pick_best_search_hit(
         self,
         queries: str | list[str],
@@ -775,70 +996,61 @@ class RobloxGameSearchPlugin(Star):
         target_queries = [queries] if isinstance(queries, str) else queries
         target_queries = [normalize_text(query, "") for query in target_queries if normalize_text(query, "")]
 
-        def single_match_score(query: str, candidate: dict[str, Any]) -> float:
-            query_norm = normalize_match_text(query)
-            query_key = compact_match_text(query)
-            query_acronym = query_key
-            name = candidate.get("name", "")
-            name_norm = normalize_match_text(name)
-            name_key = compact_match_text(name)
-            name_words = name_norm.split()
-            name_acronym = "".join(word[0] for word in name_words if word)
-
-            if query_norm and name_norm == query_norm:
-                return 10000
-            if query_key and name_key == query_key:
-                return 9500
-            if query_acronym and len(query_acronym) >= 2 and name_acronym == query_acronym:
-                return 9000
-            if query_norm and name_norm.startswith(query_norm):
-                return 5200
-            if query_key and name_key.startswith(query_key):
-                return 4800
-            if query_acronym and len(query_acronym) >= 2 and name_acronym.startswith(query_acronym):
-                return 4600
-            if query_norm and f" {query_norm} " in f" {name_norm} ":
-                return 3400
-            if query_key and query_key in name_key:
-                return 2600
-            return SequenceMatcher(None, query_norm, name_norm).ratio() * 1500
-
-        def match_score(candidate: dict[str, Any]) -> float:
-            return max((single_match_score(query, candidate) for query in target_queries), default=0.0)
-
-        def score(candidate: dict[str, Any]) -> float:
-            base = match_score(candidate)
-            if candidate.get("emphasis"):
-                base += 450
-            if candidate.get("is_sponsored"):
-                base -= 1600
-
-            players = max(0, int(candidate.get("player_count", 0) or 0))
-            up_votes = max(0, int(candidate.get("total_up_votes", 0) or 0))
-            base += min(math.log10(players + 1) * 130, 650)
-            base += min(math.log10(up_votes + 1) * 70, 420)
-            base -= int(candidate.get("result_index", 0)) * 2
-            base -= int(candidate.get("_best_query_index", 0)) * 20
-            return base
-
-        best = max(candidates, key=score)
-        best_match = match_score(best)
+        best = max(candidates, key=lambda candidate: self._candidate_score(target_queries, candidate))
+        best_match = self._match_score(target_queries, best)
         min_match_score = float(self.config.get("name_match_min_score", 2200))
         if best_match < min_match_score:
             return None
         return best
 
+    def _pick_suggestions(
+        self,
+        queries: str | list[str],
+        candidates: list[dict[str, Any]],
+        best: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+
+        target_queries = [queries] if isinstance(queries, str) else queries
+        target_queries = [normalize_text(query, "") for query in target_queries if normalize_text(query, "")]
+        best_key = str(best.get("universe_id") or best.get("root_place_id")) if best else None
+
+        ranked = sorted(
+            candidates,
+            key=lambda candidate: self._candidate_score(target_queries, candidate),
+            reverse=True,
+        )
+        min_match_score = float(self.config.get("name_match_min_score", 2200))
+        suggestion_bar = min_match_score * 0.5
+        suggestions: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in ranked:
+            key = str(candidate.get("universe_id") or candidate.get("root_place_id"))
+            if not key or key == best_key or key in seen:
+                continue
+            if self._match_score(target_queries, candidate) < suggestion_bar:
+                continue
+            seen.add(key)
+            suggestions.append(candidate)
+            if len(suggestions) >= 3:
+                break
+        return suggestions
+
     async def _build_search_queries(self, query: str) -> list[str]:
         query_clean = normalize_text(query, "")
         cleaned_query = self._cleanup_user_search_query(query_clean)
         search_queries: list[str] = []
+        seen_keys: set[str] = set()
 
         def add(value: str | None):
             value = normalize_text(value, "")
             if not value:
                 return
-            if compact_match_text(value) in {compact_match_text(item) for item in search_queries}:
+            key = compact_match_text(value)
+            if key in seen_keys:
                 return
+            seen_keys.add(key)
             search_queries.append(value)
 
         if self._contains_chinese(query_clean):
@@ -1094,22 +1306,41 @@ class RobloxGameSearchPlugin(Star):
     async def _fetch_age_info(self, universe_id: int, name: str) -> dict[str, Any]:
         if not name:
             return {}
+        cached = self._cache_age.get(universe_id, _NOT_CACHED)
+        if cached is not _NOT_CACHED:
+            return cached or {}
+        result: dict[str, Any] = {}
         for search_hit in await self._search_game_candidates(name):
             if int(search_hit.get("universe_id", 0)) == universe_id:
-                return search_hit
-        return {}
+                result = search_hit
+                break
+        self._cache_age.set(universe_id, result)
+        return result
 
     async def _fetch_game_detail(self, universe_id: int) -> dict[str, Any] | None:
+        cached = self._cache_detail.get(universe_id, _NOT_CACHED)
+        if cached is not _NOT_CACHED:
+            return cached
         payload = await self._get_json(GAME_DETAIL_URL, params={"universeIds": str(universe_id)})
         data = payload.get("data", [])
-        return data[0] if data else None
+        detail = data[0] if data else None
+        self._cache_detail.set(universe_id, detail)
+        return detail
 
     async def _fetch_votes(self, universe_id: int) -> dict[str, Any]:
+        cached = self._cache_votes.get(universe_id, _NOT_CACHED)
+        if cached is not _NOT_CACHED:
+            return cached
         payload = await self._get_json(GAME_VOTES_URL, params={"universeIds": str(universe_id)})
         data = payload.get("data", [])
-        return data[0] if data else {"upVotes": 0, "downVotes": 0}
+        votes = data[0] if data else {"upVotes": 0, "downVotes": 0}
+        self._cache_votes.set(universe_id, votes)
+        return votes
 
     async def _fetch_image(self, universe_id: int) -> str:
+        cached = self._cache_image.get(universe_id, _NOT_CACHED)
+        if cached is not _NOT_CACHED:
+            return cached
         params = {
             "universeIds": str(universe_id),
             "returnPolicy": "PlaceHolder",
@@ -1119,23 +1350,33 @@ class RobloxGameSearchPlugin(Star):
         }
         payload = await self._get_json(GAME_ICON_URL, params=params)
         data = payload.get("data", [])
-        if data:
-            return data[0].get("imageUrl") or ""
-        return ""
+        image_url = (data[0].get("imageUrl") or "") if data else ""
+        self._cache_image.set(universe_id, image_url)
+        return image_url
 
     async def _place_to_universe(self, place_id: int) -> int | None:
+        cached = self._cache_place_universe.get(place_id, _NOT_CACHED)
+        if cached is not _NOT_CACHED:
+            return cached
         try:
             payload = await self._get_json(PLACE_TO_UNIVERSE_URL.format(place_id=place_id))
         except httpx.HTTPStatusError:
+            self._cache_place_universe.set(place_id, None)
             return None
         universe_id = payload.get("universeId")
-        return int(universe_id) if universe_id else None
+        result = int(universe_id) if universe_id else None
+        self._cache_place_universe.set(place_id, result)
+        return result
 
     async def _fetch_servers(self, root_place_id: int) -> tuple[list[RobloxServer], bool, bool, bool]:
         if root_place_id <= 0:
             return [], False, False, False
 
-        page_size = min(100, max(10, int(self.config.get("server_page_size", 30))))
+        cached = self._cache_servers.get(root_place_id, _NOT_CACHED)
+        if cached is not _NOT_CACHED:
+            return cached
+
+        page_size = self._valid_server_page_size()
         page_limit = max(1, int(self.config.get("server_scan_page_limit", 5)))
         cursor = None
         all_servers: list[RobloxServer] = []
@@ -1160,12 +1401,17 @@ class RobloxGameSearchPlugin(Star):
                 break
 
             for item in payload.get("data", []):
-                playing = int(item.get("playing", 0))
-                max_players = int(item.get("maxPlayers", 0))
-                ping = item.get("ping")
-                fps = item.get("fps")
-                all_servers.append(
-                    RobloxServer(
+                try:
+                    playing_raw = item.get("playing")
+                    max_players_raw = item.get("maxPlayers")
+                    if playing_raw is None or max_players_raw is None:
+                        # Roblox 偶发返回 null 的异常条目，跳过避免污染统计
+                        continue
+                    playing = int(playing_raw)
+                    max_players = int(max_players_raw)
+                    ping = item.get("ping")
+                    fps = item.get("fps")
+                    server = RobloxServer(
                         id=str(item.get("id", "")),
                         playing=playing,
                         max_players=max_players,
@@ -1173,7 +1419,10 @@ class RobloxGameSearchPlugin(Star):
                         fps=float(fps) if fps is not None else None,
                         status=summarize_status(playing, max_players),
                     )
-                )
+                except (TypeError, ValueError) as exc:
+                    logger.warning("跳过无法解析的公开服务器数据（place_id=%s）: %r", root_place_id, item)
+                    continue
+                all_servers.append(server)
 
             cursor = payload.get("nextPageCursor")
             if not cursor:
@@ -1184,7 +1433,10 @@ class RobloxGameSearchPlugin(Star):
 
         if cursor:
             scanned_all = False
-        return all_servers, scanned_all, page_limit_hit, server_data_available
+
+        result = (all_servers, scanned_all, page_limit_hit, server_data_available)
+        self._cache_servers.set(root_place_id, result)
+        return result
 
     async def _build_game(
         self,
@@ -1193,9 +1445,13 @@ class RobloxGameSearchPlugin(Star):
         image_url: str,
         fallback_description: str,
         age_info: dict[str, Any] | None,
+        fetch_servers: bool = True,
     ) -> RobloxGame:
         root_place_id = int(detail.get("rootPlaceId", 0))
-        servers, scanned_all, page_limit_hit, server_data_available = await self._fetch_servers(root_place_id)
+        if fetch_servers:
+            servers, scanned_all, page_limit_hit, server_data_available = await self._fetch_servers(root_place_id)
+        else:
+            servers, scanned_all, page_limit_hit, server_data_available = [], False, False, False
 
         genre_l1 = normalize_text(detail.get("genre_l1"), "")
         genre_l2 = normalize_text(detail.get("genre_l2"), "")
@@ -1218,7 +1474,9 @@ class RobloxGameSearchPlugin(Star):
             age_recommendation=normalize_text((age_info or {}).get("age_recommendation"), ""),
             content_maturity=normalize_text((age_info or {}).get("content_maturity"), ""),
             minimum_age=int((age_info or {}).get("minimum_age", 0) or 0),
-            playing=int(detail.get("playing", 0)),
+            playing=int(detail.get("playing", 0) or 0),
+            visits=int(detail.get("visits", 0) or 0),
+            favorited=int(detail.get("favoritedCount", 0) or 0),
             up_votes=int(votes.get("upVotes", 0)),
             down_votes=int(votes.get("downVotes", 0)),
             image_url=image_url,
@@ -1226,7 +1484,42 @@ class RobloxGameSearchPlugin(Star):
             scanned_all_servers=scanned_all,
             page_limit_hit=page_limit_hit,
             server_data_available=server_data_available,
+            servers_skipped=not fetch_servers,
         )
+
+    def _valid_server_page_size(self) -> int:
+        value = max(1, int(self.config.get("server_page_size", 50)))
+        # 收敛到 Roblox 接口合法值（10/25/50/100），配置了其他值也不会 400
+        return min(VALID_SERVER_PAGE_SIZES, key=lambda option: (abs(option - value), option))
+
+    def _display_servers(
+        self,
+        game: RobloxGame,
+        servers_arg: str | None,
+        sort_mode: str,
+    ) -> list[RobloxServer]:
+        limit = max(1, int(self.config.get("server_display_limit", 10)))
+        if servers_arg:
+            limit = max(1, int(servers_arg))
+
+        servers = list(game.servers)
+        if sort_mode == "players":
+            servers.sort(key=lambda server: server.playing, reverse=True)
+        elif sort_mode == "free":
+            servers.sort(
+                key=lambda server: (
+                    (server.max_players - server.playing) if server.max_players > 0 else -1
+                ),
+                reverse=True,
+            )
+        else:  # 默认按延迟从低到高，延迟未知的排最后
+            servers.sort(
+                key=lambda server: (
+                    server.ping is None,
+                    server.ping if server.ping is not None else math.inf,
+                )
+            )
+        return servers[:limit]
 
     def _render_text(self, game: RobloxGame, display_servers: list[RobloxServer]) -> str:
         lines = [
@@ -1236,6 +1529,8 @@ class RobloxGameSearchPlugin(Star):
             f"年龄组：{game.age_text}",
             f"类型 / 好评度：{game.genre} / {game.rating_text}",
             f"在线人数：{game.playing_text}",
+            f"总访问量：{game.visits_text}",
+            f"收藏数：{game.favorited_text}",
             f"公开服务器数：{game.server_count_text}",
             f"公开服在线总人数：{game.server_players_text}",
             "服务器状态：",
@@ -1249,6 +1544,8 @@ class RobloxGameSearchPlugin(Star):
         return "\n".join(lines)
 
     def _server_note(self, game: RobloxGame, display_servers: list[RobloxServer]) -> str:
+        if game.servers_skipped:
+            return "已按 --简洁 模式跳过公开服务器扫描，未统计服务器数据。"
         shown = len(display_servers)
         total = len(game.servers)
         if not game.server_data_available:
