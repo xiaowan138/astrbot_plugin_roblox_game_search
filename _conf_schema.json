@@ -87,6 +87,18 @@
     "default": true,
     "hint": "缓存游戏详情、投票、图片、年龄组和服务器数据，重复查询更快且更省 Roblox 接口额度。"
   },
+  "cache_votes_ttl_seconds": {
+    "description": "好评率数据缓存时长（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "投票数据变化比静态数据快，单独用更短的缓存。设为 0 表示立即过期。"
+  },
+  "proxy": {
+    "description": "HTTP(S) 代理地址",
+    "type": "string",
+    "default": "",
+    "hint": "访问 Roblox / Google 翻译需要代理时填写，例如 http://127.0.0.1:7897。留空则使用系统环境变量代理。"
+  },
   "cache_static_ttl_seconds": {
     "description": "静态数据缓存时长（秒）",
     "type": "int",
