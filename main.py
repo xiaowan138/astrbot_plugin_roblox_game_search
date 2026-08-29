@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import math
 import re
@@ -456,6 +457,12 @@ def format_number(value: int) -> str:
     return f"{value:,}"
 
 
+def truncate_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "…"
+
+
 def normalize_text(value: str | None, fallback: str) -> str:
     if not value:
         return fallback
@@ -493,7 +500,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.3.0",
+    "0.3.1",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -502,7 +509,7 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         client_kwargs: dict[str, Any] = {
             "timeout": httpx.Timeout(timeout),
-            "headers": {"User-Agent": "AstrBot-Roblox-Search/0.3.0"},
+            "headers": {"User-Agent": "AstrBot-Roblox-Search/0.3.1"},
             "follow_redirects": True,
         }
         proxy = normalize_text(str(self.config.get("proxy", "")), "")
@@ -527,6 +534,8 @@ class RobloxGameSearchPlugin(Star):
         self._cache_age = TTLCache(static_ttl)
         self._cache_servers = TTLCache(servers_ttl)
         self._cache_place_universe = TTLCache(static_ttl)
+        # 图片字节流单独收紧容量，避免大图占内存
+        self._cache_image_bytes = TTLCache(static_ttl, max_entries=32)
 
         # 收藏夹:JSON 文件持久化,按发送者区分;路径可在测试中覆盖
         self._fav_lock = asyncio.Lock()
@@ -632,10 +641,13 @@ class RobloxGameSearchPlugin(Star):
 
             display_servers = self._display_servers(game, args["servers"], args["sort"])
 
+            # 图片由插件自身的 client（可配代理）下载，避免平台层/渲染浏览器直连拉图失败
+            downloaded_image = await self._download_image_bytes(game.image_url, use_cache=use_cache)
+
             if render_mode == "text":
                 yield event.chain_result(
                     [
-                        Comp.Image.fromURL(game.image_url),
+                        self._image_component(game.image_url, downloaded_image),
                         Comp.Plain(self._render_text(game, display_servers)),
                     ]
                 )
@@ -648,7 +660,7 @@ class RobloxGameSearchPlugin(Star):
                         "background": background,
                         "game": {
                             "name": game.name,
-                            "image_url": game.image_url,
+                            "image_url": self._image_data_uri(game.image_url, downloaded_image),
                             "description": game.description,
                             "creator_name": game.creator_name,
                             "genre": game.genre,
@@ -682,7 +694,7 @@ class RobloxGameSearchPlugin(Star):
                 logger.warning("HTML 渲染失败，已自动降级为文本模式: %s", exc)
                 yield event.chain_result(
                     [
-                        Comp.Image.fromURL(game.image_url),
+                        self._image_component(game.image_url, downloaded_image),
                         Comp.Plain(self._render_text(game, display_servers)),
                     ]
                 )
@@ -778,9 +790,14 @@ class RobloxGameSearchPlugin(Star):
 
         background, text = self._extract_background_option(text)
 
-        server_match = re.search(r"--?(?:服务器数|servers?)=(\d+)", text, re.IGNORECASE)
+        # 与 --排序 一致：支持 --服务器数=5 与 --服务器数 5 两种写法；
+        # 未知值或孤立的 --服务器数 也剥掉，避免污染游戏名
+        server_match = re.search(r"--?(?:服务器数|servers?)[= ](\d+)", text, re.IGNORECASE)
         if server_match:
             text = text.replace(server_match.group(0), " ").strip()
+        else:
+            text = re.sub(r"--?(?:服务器数|servers?)=\S+", " ", text, flags=re.IGNORECASE).strip()
+            text = re.sub(r"(?:^|\s)--?(?:服务器数|servers?)(?=\s|$)", " ", text, flags=re.IGNORECASE).strip()
 
         return {
             "query": normalize_text(text, ""),
@@ -1687,6 +1704,43 @@ class RobloxGameSearchPlugin(Star):
         self._cache_image.set(universe_id, image_url)
         return image_url
 
+    async def _download_image_bytes(
+        self, image_url: str, use_cache: bool = True
+    ) -> tuple[bytes, str] | None:
+        """用插件自身的 client（可配代理）下载图片，返回 (字节流, MIME 类型)。"""
+        if not image_url:
+            return None
+        if use_cache:
+            cached = self._cache_image_bytes.get(image_url, _NOT_CACHED)
+            if cached is not _NOT_CACHED:
+                return cached
+        try:
+            response = await self.client.get(image_url)
+            response.raise_for_status()
+            content_type = (response.headers.get("content-type") or "").split(";")[0].strip()
+            payload = response.content
+            result = (payload, content_type or "image/png") if payload else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("下载游戏图片失败（url=%s）: %s", image_url, exc)
+            result = None
+        if result is not None:
+            self._cache_image_bytes.set(image_url, result)
+        return result
+
+    @staticmethod
+    def _image_component(image_url: str, downloaded: tuple[bytes, str] | None) -> Comp.Image:
+        if downloaded:
+            return Comp.Image.fromBytes(downloaded[0])
+        return Comp.Image.fromURL(image_url)
+
+    @staticmethod
+    def _image_data_uri(image_url: str, downloaded: tuple[bytes, str] | None) -> str:
+        if downloaded:
+            data, content_type = downloaded
+            encoded = base64.b64encode(data).decode("ascii")
+            return f"data:{content_type};base64,{encoded}"
+        return image_url
+
     async def _place_to_universe(self, place_id: int, use_cache: bool = True) -> int | None:
         if use_cache:
             cached = self._cache_place_universe.get(place_id, _NOT_CACHED)
@@ -1736,6 +1790,8 @@ class RobloxGameSearchPlugin(Star):
             except RobloxRateLimitError:
                 scanned_all = False
                 page_limit_hit = True
+                # 一页都没扫到时不当作"有数据"，避免 HTML 渲染出只有表头的空表格
+                server_data_available = bool(all_servers)
                 break
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                 logger.warning("获取 Roblox 公开服务器失败（place_id=%s）: %s", root_place_id, exc)
@@ -1871,7 +1927,7 @@ class RobloxGameSearchPlugin(Star):
     def _render_text(self, game: RobloxGame, display_servers: list[RobloxServer]) -> str:
         lines = [
             f"游戏名：{game.name}",
-            f"游戏简介：{game.description}",
+            f"游戏简介：{truncate_text(game.description, 200)}",
             f"开发者：{game.creator_name}",
             f"年龄组：{game.age_text}",
             f"类型 / 好评度：{game.genre} / {game.rating_text}",
