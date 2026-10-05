@@ -110,5 +110,24 @@
     "type": "int",
     "default": 180,
     "hint": "在线服务器数据变化较快，缓存时间短一些，默认 3 分钟。设为 0 表示立即过期。"
+  },
+  "empty_query_mode": {
+    "description": "不带游戏名时的回复方式",
+    "type": "string",
+    "default": "random",
+    "options": ["random", "fixed", "usage"],
+    "hint": "random＝随机推荐一个热门游戏；fixed＝固定回复配置里的那个游戏；usage＝显示用法说明。也可用 --随机 参数临时强制随机。"
+  },
+  "empty_query_fixed_game": {
+    "description": "固定回复的游戏（empty_query_mode=fixed 时生效）",
+    "type": "string",
+    "default": "",
+    "hint": "填写游戏名、游戏 ID 或 Roblox 游戏链接，例如 DOORS 或 6516141723。留空则自动回退为随机推荐。"
+  },
+  "random_pool": {
+    "description": "随机推荐池",
+    "type": "text",
+    "default": "",
+    "hint": "自定义随机候选，支持游戏名或 ID，用逗号、顿号或换行分隔，例如：DOORS, Blox Fruits, 6516141723。留空使用内置热门游戏列表。"
   }
 }

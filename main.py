@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import math
+import random
 import re
 import time
 import uuid
@@ -68,6 +69,42 @@ _BACKGROUND_ALLOWED_CHARS = set(
 # 消息内展示的服务器数量上限,防止配置过大生成超大图片
 MAX_DISPLAY_SERVERS = 50
 
+# 内联进 HTML 的图标体积上限:超过则改用占位图,避免生成超大页面
+MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024
+
+# 空参数时随机推荐的兜底池。用游戏名而不是硬编码 ID,避免 ID 失效指向别的游戏;
+# 可用 random_pool 配置覆盖(支持逗号/换行/顿号分隔的 ID 或名称)。
+BUILTIN_RANDOM_POOL = (
+    "Adopt Me",
+    "Brookhaven RP",
+    "Blox Fruits",
+    "DOORS",
+    "Murder Mystery 2",
+    "BedWars",
+    "Pet Simulator 99",
+    "Tower of Hell",
+    "Arsenal",
+    "Jailbreak",
+    "Rainbow Friends",
+    "Welcome to Bloxburg",
+    "Piggy",
+    "Natural Disaster Survival",
+    "Epic Minigames",
+    "Bee Swarm Simulator",
+    "Anime Adventures",
+    "Fisch",
+    "Blade Ball",
+    "Dress to Impress",
+    "Grow a Garden",
+    "Sols RNG",
+)
+
+# 空参数行为的合法取值
+EMPTY_QUERY_MODES = ("random", "fixed", "usage")
+
+# 随机推荐时最多尝试几个候选(命中失败会自动换下一个)
+RANDOM_QUERY_ATTEMPTS = 3
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -77,13 +114,16 @@ HTML_TEMPLATE = """
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      padding: 32px;
-      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      padding: 28px;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC",
+        "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
       background: {{ background }};
       color: #f8fafc;
     }
     .panel {
-      width: 1120px;
+      width: 100%;
+      max-width: 1120px;
+      margin: 0 auto;
       border-radius: 28px;
       overflow: hidden;
       border: 1px solid rgba(255, 255, 255, 0.14);
@@ -99,6 +139,7 @@ HTML_TEMPLATE = """
       background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0));
     }
     .cover {
+      position: relative;
       width: 320px;
       height: 320px;
       border-radius: 24px;
@@ -106,7 +147,23 @@ HTML_TEMPLATE = """
       border: 1px solid rgba(255, 255, 255, 0.14);
       background: rgba(15, 23, 42, 0.9);
     }
+    /* 占位层永远铺满封面:图片没下载到或加载失败时也不会出现裂图 */
+    .cover-fallback {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 104px;
+      font-weight: 800;
+      line-height: 1;
+      color: rgba(248, 250, 252, 0.26);
+      text-transform: uppercase;
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.45), rgba(15, 23, 42, 0.95));
+    }
     .cover img {
+      position: relative;
+      z-index: 1;
       width: 100%;
       height: 100%;
       object-fit: cover;
@@ -208,13 +265,22 @@ HTML_TEMPLATE = """
       background: rgba(255, 255, 255, 0.04);
       border: 1px solid rgba(255, 255, 255, 0.08);
     }
+    /* 渲染窗口偏窄时不再横向裁切内容 */
+    @media (max-width: 960px) {
+      body { padding: 16px; }
+      .hero { grid-template-columns: 1fr; }
+      .cover { width: 100%; max-width: 320px; height: auto; aspect-ratio: 1 / 1; }
+      .title { font-size: 32px; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
   </style>
 </head>
 <body>
   <div class="panel">
     <div class="hero">
       <div class="cover">
-        <img src="{{ game.image_url | e }}" alt="game-icon" />
+        <div class="cover-fallback">{{ game.initial | e }}</div>
+        {% if game.has_image %}<img src="{{ game.image_url | e }}" alt="game-icon" onerror="this.remove()" />{% endif %}
       </div>
       <div>
         <h1 class="title">{{ game.name | e }}</h1>
@@ -500,7 +566,7 @@ def summarize_status(playing: int, max_players: int) -> str:
     "astrbot_plugin_roblox_game_search",
     "xiaowan",
     "通过 Roblox 游戏搜索与 Roblox 游戏ID搜索 指令查询 Roblox 游戏详情。",
-    "0.3.1",
+    "0.4.0",
 )
 class RobloxGameSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -509,7 +575,7 @@ class RobloxGameSearchPlugin(Star):
         timeout = float(self.config.get("request_timeout", 20))
         client_kwargs: dict[str, Any] = {
             "timeout": httpx.Timeout(timeout),
-            "headers": {"User-Agent": "AstrBot-Roblox-Search/0.3.1"},
+            "headers": {"User-Agent": "AstrBot-Roblox-Search/0.4.0"},
             "follow_redirects": True,
         }
         proxy = normalize_text(str(self.config.get("proxy", "")), "")
@@ -597,7 +663,7 @@ class RobloxGameSearchPlugin(Star):
         args = self._parse_command_args(query_text, command_names)
         query = args["query"]
 
-        if args["help"] or not query:
+        if args["help"]:
             yield event.plain_result(self._usage_text(search_mode))
             return
 
@@ -605,44 +671,74 @@ class RobloxGameSearchPlugin(Star):
             yield event.plain_result("输出模式冲突：--文本 和 --图片 只能选择其中一个，请去掉一个后重试。")
             return
 
-        # 支持直接粘贴 Roblox 游戏链接：自动提取数字 ID 并按 ID 搜索
-        url_id = self._extract_game_url_id(query)
-        if url_id is not None:
-            query = url_id
-            search_mode = "id"
+        random_requested = bool(args["random"])
+        if query:
+            # 支持直接粘贴 Roblox 游戏链接：自动提取数字 ID 并按 ID 搜索
+            url_id = self._extract_game_url_id(query)
+            if url_id is not None:
+                query = url_id
+                search_mode = "id"
 
-        if search_mode == "name" and query.isdigit():
-            yield event.plain_result("这个指令用于按游戏名搜索。纯数字 ID 请使用 /roblox游戏ID搜索。")
-            return
+            if not random_requested:
+                if search_mode == "name" and query.isdigit():
+                    yield event.plain_result("这个指令用于按游戏名搜索。纯数字 ID 请使用 /roblox游戏ID搜索。")
+                    return
 
-        if search_mode == "id" and not query.isdigit():
-            yield event.plain_result("这个指令只接受纯数字 ID。游戏名请使用 /roblox游戏搜索。")
-            return
+                if search_mode == "id" and not query.isdigit():
+                    yield event.plain_result("这个指令只接受纯数字 ID。游戏名请使用 /roblox游戏搜索。")
+                    return
 
         render_mode = args["mode"] or str(self.config.get("default_render_mode", "html")).lower()
         background = self._resolve_background(args["background"])
         fetch_servers = not args["compact"]
         use_cache = not args["refresh"]
 
+        # 没有指定游戏名（或显式用了 --随机）时，按配置决定随机推荐 / 固定游戏 / 用法说明
+        if query and not random_requested:
+            targets: list[tuple[str, str]] = [(search_mode, query)]
+            empty_reason = ""
+        else:
+            targets, empty_reason = self._empty_query_targets()
+        if not targets:
+            yield event.plain_result(self._usage_text(search_mode))
+            return
+
         try:
-            if search_mode == "name":
-                game, suggestions = await self._resolve_game_by_name(
-                    query, fetch_servers=fetch_servers, use_cache=use_cache
-                )
-            else:
-                game = await self._resolve_game_by_id(
-                    int(query), fetch_servers=fetch_servers, use_cache=use_cache
-                )
-                suggestions = []
+            game: RobloxGame | None = None
+            suggestions: list[dict[str, Any]] = []
+            matched_query = query
+            for candidate_mode, candidate_query in targets:
+                if candidate_mode == "name":
+                    game, suggestions = await self._resolve_game_by_name(
+                        candidate_query, fetch_servers=fetch_servers, use_cache=use_cache
+                    )
+                else:
+                    game = await self._resolve_game_by_id(
+                        int(candidate_query), fetch_servers=fetch_servers, use_cache=use_cache
+                    )
+                    suggestions = []
+                if game:
+                    matched_query = candidate_query
+                    break
 
             if not game:
-                yield event.plain_result(self._not_found_text(query, suggestions))
+                if empty_reason == "random":
+                    yield event.plain_result(
+                        "随机推荐暂时没取到数据（Roblox 搜索接口波动），请稍后再试，或直接发送游戏名搜索。"
+                    )
+                elif empty_reason == "fixed":
+                    yield event.plain_result(
+                        "配置里指定的固定游戏解析失败，请检查「空参数固定游戏」是否为有效的游戏名、ID 或链接。"
+                    )
+                else:
+                    yield event.plain_result(self._not_found_text(matched_query, suggestions))
                 return
 
             display_servers = self._display_servers(game, args["servers"], args["sort"])
 
             # 图片由插件自身的 client（可配代理）下载，避免平台层/渲染浏览器直连拉图失败
             downloaded_image = await self._download_image_bytes(game.image_url, use_cache=use_cache)
+            image_src = self._image_data_uri(game.image_url, downloaded_image)
 
             if render_mode == "text":
                 yield event.chain_result(
@@ -660,7 +756,9 @@ class RobloxGameSearchPlugin(Star):
                         "background": background,
                         "game": {
                             "name": game.name,
-                            "image_url": self._image_data_uri(game.image_url, downloaded_image),
+                            "image_url": image_src,
+                            "has_image": bool(image_src),
+                            "initial": self._placeholder_initial(game.name),
                             "description": game.description,
                             "creator_name": game.creator_name,
                             "genre": game.genre,
@@ -742,6 +840,7 @@ class RobloxGameSearchPlugin(Star):
         sort_mode = "ping"
         help_requested = False
         refresh = False
+        random_requested = False
         mode_conflict = False
 
         text_pattern = r"(?:^|\s)--?(?:文本|text)(?:\s|$)"
@@ -767,6 +866,11 @@ class RobloxGameSearchPlugin(Star):
         if re.search(refresh_pattern, text, re.IGNORECASE):
             refresh = True
             text = re.sub(refresh_pattern, " ", text, flags=re.IGNORECASE).strip()
+
+        random_pattern = r"(?:^|\s)--?(?:随机|random)(?:\s|$)"
+        if re.search(random_pattern, text, re.IGNORECASE):
+            random_requested = True
+            text = re.sub(random_pattern, " ", text, flags=re.IGNORECASE).strip()
 
         # 只匹配已知的排序方式，避免误吞游戏名；支持 --排序=人数 与 --排序 人数 两种写法
         sort_match = re.search(
@@ -808,6 +912,7 @@ class RobloxGameSearchPlugin(Star):
             "sort": sort_mode,
             "help": help_requested,
             "refresh": refresh,
+            "random": random_requested,
             "mode_conflict": mode_conflict,
         }
 
@@ -816,6 +921,64 @@ class RobloxGameSearchPlugin(Star):
         text = re.sub(r"^/+", "", (message or "").strip())
         commands_pattern = "|".join(re.escape(command_name) for command_name in command_names)
         return re.sub(rf"^(?:{commands_pattern})", "", text, count=1).strip()
+
+    @staticmethod
+    def _placeholder_initial(name: str) -> str:
+        """图标缺失时的占位字符：取游戏名第一个有意义的字母/汉字。"""
+        text = normalize_text(name, "R")
+        for char in text:
+            if char.isalnum() or "\u4e00" <= char <= "\u9fff":
+                return char.upper()
+        return "R"
+
+    def _random_pool(self) -> list[str]:
+        """随机池：优先用 random_pool 配置，留空用内置热门列表。"""
+        raw = str(self.config.get("random_pool", "") or "")
+        items = [item.strip() for item in re.split(r"[,\n，、;；]+", raw) if item.strip()]
+        return items or list(BUILTIN_RANDOM_POOL)
+
+    def _classify_target(self, target: str) -> tuple[str, str] | None:
+        """把用户配置/随机池里的条目解析成 (搜索模式, 查询词)。"""
+        text = normalize_text(target, "")
+        if not text:
+            return None
+        url_id = self._extract_game_url_id(text)
+        if url_id is not None:
+            return "id", url_id
+        if text.isdigit():
+            return "id", text
+        return "name", text
+
+    def _empty_query_targets(self) -> tuple[list[tuple[str, str]], str]:
+        """空参数（或 --随机）时的候选列表与原因标记。
+
+        返回 (targets, reason)，reason 为 random / fixed / usage 之一：
+        - fixed：使用配置指定的固定游戏
+        - random：从随机池抽若干个候选，逐个尝试直到命中
+        - usage：没有可用候选，调用方回退到用法说明
+        """
+        mode = str(self.config.get("empty_query_mode", "random")).strip().lower() or "random"
+        if mode not in EMPTY_QUERY_MODES:
+            mode = "random"
+
+        if mode == "usage":
+            return [], "usage"
+
+        if mode == "fixed":
+            configured = str(self.config.get("empty_query_fixed_game", "") or "")
+            classified = self._classify_target(configured)
+            if classified:
+                return [classified], "fixed"
+            # 没配置固定游戏或配置无效时退回随机，避免直接不响应
+            logger.warning("empty_query_mode=fixed 但「空参数固定游戏」未配置，已回退随机推荐")
+            mode = "random"
+
+        pool = self._random_pool()
+        if not pool:
+            return [], "usage"
+        sample = random.sample(pool, k=min(RANDOM_QUERY_ATTEMPTS, len(pool)))
+        targets = [target for target in (self._classify_target(item) for item in sample) if target]
+        return targets, ("random" if targets else "usage")
 
     @staticmethod
     def _sanitize_background(value: str | None) -> str | None:
@@ -900,7 +1063,7 @@ class RobloxGameSearchPlugin(Star):
     def _usage_text(self, search_mode: str) -> str:
         common = (
             "可选参数：--文本 | --图片 | --简洁（跳过服务器扫描）| --排序=延迟|人数|空位 "
-            "| --服务器数=N | --刷新（强制刷新缓存）| --帮助\n"
+            "| --服务器数=N | --刷新（强制刷新缓存）| --随机（随机推荐一个游戏）| --帮助\n"
             "背景：--背景=CSS（或 dark/light/blue/red/green/purple 预设名）\n"
         )
         if search_mode == "name":
@@ -914,6 +1077,7 @@ class RobloxGameSearchPlugin(Star):
                 "示例：/游戏搜索 --简洁 doors\n"
                 "示例：/游戏搜索 --排序=人数 --服务器数=5 doors\n"
                 "示例：/游戏搜索 --刷新 doors\n"
+                "示例：/游戏搜索 --随机（不带游戏名时按配置随机推荐或固定回复）\n"
                 "示例：/游戏搜索 --背景=blue Doors\n"
                 "示例：/游戏搜索 --背景=linear-gradient(135deg,#0f172a,#1d4ed8) Doors\n"
                 "复杂背景请使用引号：--背景=\"radial-gradient(...), linear-gradient(...)\" Doors\n"
@@ -1707,22 +1871,43 @@ class RobloxGameSearchPlugin(Star):
     async def _download_image_bytes(
         self, image_url: str, use_cache: bool = True
     ) -> tuple[bytes, str] | None:
-        """用插件自身的 client（可配代理）下载图片，返回 (字节流, MIME 类型)。"""
+        """用插件自身的 client（可配代理）下载图片，返回 (字节流, MIME 类型)。
+
+        图床偶尔抖动，失败会重试一次；非图片响应（例如错误页）不会被当成图片内联。
+        """
         if not image_url:
             return None
         if use_cache:
             cached = self._cache_image_bytes.get(image_url, _NOT_CACHED)
             if cached is not _NOT_CACHED:
                 return cached
-        try:
-            response = await self.client.get(image_url)
-            response.raise_for_status()
-            content_type = (response.headers.get("content-type") or "").split(";")[0].strip()
-            payload = response.content
-            result = (payload, content_type or "image/png") if payload else None
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("下载游戏图片失败（url=%s）: %s", image_url, exc)
-            result = None
+
+        result: tuple[bytes, str] | None = None
+        for attempt in range(2):
+            try:
+                response = await self.client.get(image_url)
+                response.raise_for_status()
+                content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+                payload = response.content
+                if not content_type.startswith("image/"):
+                    logger.warning(
+                        "图片响应类型异常，跳过内联（url=%s, type=%s）", image_url, content_type
+                    )
+                elif not payload:
+                    logger.warning("图片响应为空，跳过内联（url=%s）", image_url)
+                elif len(payload) > MAX_INLINE_IMAGE_BYTES:
+                    logger.warning(
+                        "图片过大，跳过内联（url=%s, size=%s）", image_url, len(payload)
+                    )
+                else:
+                    result = (payload, content_type)
+                    break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("下载游戏图片失败（url=%s, 第 %s 次）: %s", image_url, attempt + 1, exc)
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+
+        # 只缓存成功结果，失败下次仍会重试
         if result is not None:
             self._cache_image_bytes.set(image_url, result)
         return result
@@ -1730,16 +1915,22 @@ class RobloxGameSearchPlugin(Star):
     @staticmethod
     def _image_component(image_url: str, downloaded: tuple[bytes, str] | None) -> Comp.Image:
         if downloaded:
-            return Comp.Image.fromBytes(downloaded[0])
+            from_bytes = getattr(Comp.Image, "fromBytes", None)
+            if callable(from_bytes):
+                try:
+                    return from_bytes(downloaded[0])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("构造本地图片组件失败，回退为图片链接: %s", exc)
         return Comp.Image.fromURL(image_url)
 
     @staticmethod
     def _image_data_uri(image_url: str, downloaded: tuple[bytes, str] | None) -> str:
-        if downloaded:
-            data, content_type = downloaded
-            encoded = base64.b64encode(data).decode("ascii")
-            return f"data:{content_type};base64,{encoded}"
-        return image_url
+        """下载成功时返回 data URI；失败返回空串，让模板走占位图而不是渲染成裂图。"""
+        if not downloaded:
+            return ""
+        data, content_type = downloaded
+        encoded = base64.b64encode(data).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
 
     async def _place_to_universe(self, place_id: int, use_cache: bool = True) -> int | None:
         if use_cache:
